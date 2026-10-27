@@ -52,6 +52,30 @@ p.write_text(json.dumps(state))
 
 
 class PreparationTests(unittest.TestCase):
+    def shell(self, command):
+        return subprocess.run(['sh', '-c', '. "$1"; ' + command, 'test',
+                               (ROOT / 'install.sh').as_posix()],
+                              env=dict(os.environ, YTA_LIBRARY_ONLY='1'),
+                              text=True, capture_output=True)
+
+    def test_low_ram_stops_before_download(self):
+        r = self.shell('awk() { echo 8080; }; curl() { echo no-http3; }; check_memory')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('8080', r.stdout)
+
+    def test_http3_download_needs_more_headroom_than_tcp(self):
+        base = 'awk() { echo 60000; }; curl() { echo no-http3; }; '
+        self.assertNotEqual(self.shell(base + 'check_memory').returncode, 0)
+        self.assertEqual(self.shell(base + 'QUIC=0; check_memory').returncode, 0)
+
+    def test_cleanup_removes_downloads_but_retains_other_files(self):
+        r = self.shell('d=/tmp/zapret2-youtube-autotune-$$; mkdir "$d"; '
+                       'trap \'rm -f "$d/curl.tar" "$d/keep"; rmdir "$d"\' EXIT; '
+                       'touch "$d/curl.tar" "$d/keep"; remove_run_downloads "$d"; '
+                       '[ ! -e "$d/curl.tar" ] && [ -f "$d/keep" ]; '
+                       '! remove_run_downloads /tmp/unrelated')
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def run_preparation(self, state, command):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)

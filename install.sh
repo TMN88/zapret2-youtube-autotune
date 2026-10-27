@@ -1,7 +1,7 @@
 #!/bin/sh
 # Own code: MIT. Native Blockcheck2/nfqws2 remain supplied by the user's zapret2 package.
 set -eu
-VERSION=1.1.0
+VERSION=1.1.1
 MODE=autotune
 SECTION=main
 WAN_NETWORK=wan
@@ -20,6 +20,7 @@ SCAN_PID=
 TAIL_PID=
 CONFLICT=0
 MANAGER_ACTIVE=0
+LOCK_HELD=0
 
 say() { printf '%s\n' "$*"; }
 die() { say "Ошибка: $*" >&2; exit 1; }
@@ -32,6 +33,7 @@ Usage: sh install.sh [--preset | --check | --rollback BACKUP] [options]
 Default: native Blockcheck2 selection and installation, five sequential repeats.
   --preset               Test/apply the TCP pair from the successful pilot; not a per-ISP search.
   --check                Read-only prerequisites/status; no downloads, backups or changes.
+  --clean-temp           Remove curl downloads from inactive previous runs only; no router configuration changes.
   --section NAME         Podkop VPN section (default main); other sections are preserved.
   --wan-network NAME     OpenWrt WAN network (default wan).
   --curl PATH            Existing curl with HTTP3 (otherwise download verified curl into RAM).
@@ -109,6 +111,7 @@ preflight() {
 
 backup() {
     mkdir "$LOCK" 2>/dev/null || die "Уже есть запуск/lock: $LOCK. Не запускайте два подбора одновременно."
+    LOCK_HELD=1
     printf '%s\n' "$$" > "$LOCK/pid"
     umask 077
     BACKUP="/root/zapret2-youtube-backup-$(date +%Y%m%d-%H%M%S)-$$"
@@ -171,6 +174,8 @@ cleanup() {
     trap - EXIT HUP INT TERM
     if [ -n "$SCAN_PID" ]; then kill -TERM "$SCAN_PID" 2>/dev/null || true; wait "$SCAN_PID" 2>/dev/null || true; fi
     [ -z "$TAIL_PID" ] || kill "$TAIL_PID" 2>/dev/null || true
+    # Release tmpfs RAM before attempting rollback/service restarts.
+    if [ -n "$RUN" ]; then remove_run_downloads "$RUN"; fi
     if [ "$MANAGER_ACTIVE" = 1 ]; then
         say 'Ожидание завершения пакетной операции manager перед возвратом (opkg принудительно не прерывается).' >&2
         manager_done=0
@@ -190,8 +195,39 @@ cleanup() {
         say 'Подбор/применение не завершились: возвращаю исходную конфигурацию.' >&2
         if ! sh "$BACKUP/rollback.sh"; then say "Автовозврат не завершился; выполните sh $BACKUP/rollback.sh" >&2; fi
     fi
-    if [ -n "$RUN" ]; then rmdir "$LOCK" 2>/dev/null || { rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true; }; fi
+    if [ "$LOCK_HELD" = 1 ]; then rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true; fi
     exit "$rc"
+}
+
+remove_run_downloads() {
+    case "$1" in /tmp/zapret2-youtube-autotune-*) ;;
+        *) return 1;;
+    esac
+    suffix=${1#/tmp/zapret2-youtube-autotune-}
+    case "$suffix" in ''|*[!0-9]*) return 1;; esac
+    [ -d "$1" ] && [ ! -L "$1" ] || return 0
+    # No recursive removal, glob deletion, or removal of caller-supplied --curl.
+    rm -f "$1/curl.tar.xz" "$1/curl.tar" "$1/curl-http3" "$1/media.curl"
+}
+
+clean_stale_downloads() {
+    for old_run in /tmp/zapret2-youtube-autotune-*; do
+        suffix=${old_run#/tmp/zapret2-youtube-autotune-}
+        case "$suffix" in ''|*[!0-9]*) continue;; esac
+        [ "$suffix" != "$$" ] || continue
+        kill -0 "$suffix" 2>/dev/null && continue
+        remove_run_downloads "$old_run"
+    done
+}
+
+check_memory() {
+    # df /tmp is tmpfs capacity, not available physical memory.
+    required_kb=40000
+    if [ "$QUIC" = 1 ] && [ -z "$CURL_BIN" ] && ! curl --version | grep -q ' HTTP3'; then required_kb=80000; fi
+    available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    case "$available_kb" in ''|*[!0-9]*) die 'Не удалось определить MemAvailable.';; esac
+    say "RAM MemAvailable: $available_kb kB; минимум для этого запуска: $required_kb kB."
+    [ "$available_kb" -ge "$required_kb" ] || die 'Недостаточно доступной RAM. Подбор не запускается; освободите память или используйте --no-quic. Tailscale не останавливается.'
 }
 
 fetch() {
@@ -249,6 +285,7 @@ ensure_curl() {
         printf '%s  %s\n' e20f26e5b87c1883608f286f86bdabf39d3b8556e8a8e75dfe205e14bd206199 "$RUN/curl.tar.xz" | sha256sum -c -
         xz -dc "$RUN/curl.tar.xz" > "$RUN/curl.tar"
         tar -xOf "$RUN/curl.tar" curl > "$RUN/curl-http3"
+        rm -f "$RUN/curl.tar.xz" "$RUN/curl.tar"
         chmod 700 "$RUN/curl-http3"
         CURL_BIN="$RUN/curl-http3"
         "$CURL_BIN" --version | grep -q ' HTTP3' || die 'Загруженный curl не имеет HTTP3.'
@@ -311,12 +348,17 @@ prepare_podkop() {
         dns_ready=0
         for attempt in 1 2 3 4 5; do
             ips=$(printf '%s\n' "$host" | /opt/zapret2/mdig/mdig --family=4) || ips=
+            printf 'DNS %s attempt %s: %s\n' "$host" "$attempt" "${ips:-EMPTY}" >> "$BACKUP/dns-preparation.log"
             if [ -n "$ips" ] && ! printf '%s\n' "$ips" | grep -Eq '(^|[[:space:]])198\.(18|19)\.'; then
                 dns_ready=1; break
             fi
             sleep 2
         done
-        [ "$dns_ready" = 1 ] || die "Нет реального DNS для $host после замены Russia Inside/YouTube во всех секциях. Проверьте пользовательские/удалённые списки; выполняется возврат."
+        if [ "$dns_ready" != 1 ]; then
+            logread | tail -n 200 > "$BACKUP/system-preparation.log"
+            if [ -z "$ips" ]; then die "DNS не ответил для $host. Это не доказательство FakeIP. Журналы: $BACKUP/dns-preparation.log и system-preparation.log; выполняется возврат."
+            else die "DNS вернул FakeIP для $host: $ips. Проверьте пользовательские/удалённые списки; выполняется возврат."; fi
+        fi
     done
     say 'YouTube исключён из community-списков Podkop; остальные параметры секций сохранены.'
 }
@@ -494,7 +536,7 @@ main() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --help|-h) help; return;; --version) say "$VERSION"; return;;
-            --check) MODE=check;; --preset) MODE=preset;;
+            --check) MODE=check;; --preset) MODE=preset;; --clean-temp) MODE=clean;;
             --no-quic) QUIC=0;; --require-quic) REQUIRE_QUIC=1;;
             --section|--wan-network|--curl|--media-url-file)
                 [ "$#" -ge 2 ] || die "Нет значения $1"
@@ -511,16 +553,28 @@ main() {
         shift
     done
     valid_name "$SECTION" && valid_name "$WAN_NETWORK" || die 'Некорректное имя секции/WAN.'
+    if [ "$MODE" = clean ]; then
+        [ "$(id -u)" = 0 ] || die 'Запустите от root.'
+        mkdir "$LOCK" 2>/dev/null || die 'Есть lock подбора; очистка не запущена.'
+        LOCK_HELD=1
+        trap cleanup EXIT
+        clean_stale_downloads
+        say 'Архивы/curl неактивных запусков очищены. Конфигурация не менялась.'
+        return
+    fi
     [ "$MODE" != check ] || { audit; return; }
     [ "$REQUIRE_QUIC" = 0 ] || [ "$QUIC" = 1 ] || die '--require-quic несовместим с --no-quic.'
     preflight
     backup
     trap cleanup EXIT
     trap 'exit 130' HUP INT TERM
+    clean_stale_downloads
+    check_memory
     ensure_zapret2
     ensure_curl
     write_assets
     prepare_podkop
+    check_memory
     choose
     apply_profiles
     verify
