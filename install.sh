@@ -1,7 +1,7 @@
 #!/bin/sh
 # Own code: MIT. Native Blockcheck2/nfqws2 remain supplied by the user's zapret2 package.
 set -eu
-VERSION=1.0.0
+VERSION=1.0.1
 MODE=autotune
 SECTION=main
 WAN_NETWORK=wan
@@ -243,10 +243,11 @@ ensure_curl() {
         free_kb=$(df -k /tmp | awk 'NR==2 {print $4}')
         [ "$free_kb" -ge 35000 ] || die 'Для HTTP3 нужно не менее 35 МБ свободного /tmp.'
         if ! command -v xz >/dev/null; then
-            say 'Установка signed-feed зависимости xz-utils для распаковки curl.'
+            say 'Установка signed-feed зависимости xz для распаковки curl.'
             opkg update > "$BACKUP/opkg-update.log" 2>&1
-            opkg install xz-utils > "$BACKUP/opkg-xz.log" 2>&1
+            opkg install xz > "$BACKUP/opkg-xz.log" 2>&1
         fi
+        command -v xz >/dev/null 2>&1 || die 'После установки пакета xz команда xz недоступна; проверьте opkg-xz.log в резервной копии.'
         fetch 'https://github.com/stunnel/static-curl/releases/download/8.23.0-1/curl-linux-aarch64-musl-8.23.0-1.tar.xz' "$RUN/curl.tar.xz"
         printf '%s  %s\n' e20f26e5b87c1883608f286f86bdabf39d3b8556e8a8e75dfe205e14bd206199 "$RUN/curl.tar.xz" | sha256sum -c -
         xz -dc "$RUN/curl.tar.xz" > "$RUN/curl.tar"
