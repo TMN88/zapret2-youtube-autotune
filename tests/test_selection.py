@@ -23,7 +23,7 @@ class SelectionTests(unittest.TestCase):
             p = Path(d)
             for name, body in [('log', log), ('candidates', candidates), ('targets', targets)]:
                 (p / name).write_text(body, encoding='utf-8')
-            return subprocess.run(['awk', '-v', f'targets={p / "targets"}', '-v', f'repeats={repeats}',
+            return subprocess.run(['awk', '-v', f'targets={(p / "targets").as_posix()}', '-v', f'repeats={repeats}',
                                    '-v', 'protocol=curl_test_https_tls13', '-f', str(ROOT / 'src/select.awk'),
                                    str(p / 'candidates'), str(p / 'log')], text=True, capture_output=True)
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Own code: MIT. Native Blockcheck2/nfqws2 remain supplied by the user's zapret2 package.
 set -eu
-VERSION=1.0.1
+VERSION=1.1.0
 MODE=autotune
 SECTION=main
 WAN_NETWORK=wan
@@ -41,7 +41,7 @@ Default: native Blockcheck2 selection and installation, five sequential repeats.
   --rollback BACKUP      Run the root-only rollback saved by this installer.
   --help | --version
 Requires Podkop and Routerich zapret2 (or already installed Zapret Manager to install it).
-Never installs firmware or changes Tailscale. Does not replace Forkop or foreign strategies.
+Never installs firmware or changes Tailscale. Backs up/replaces existing zapret2 strategies.
 HELP
 }
 
@@ -50,7 +50,7 @@ expanded_lists() {
     out=
     for item in "$@"; do
         case "$item" in
-            russia_inside) items='geoblock block porn news anime hdrezka tiktok meta twitter';;
+            russia_inside) items='geoblock block porn news anime hdrezka tiktok meta twitter discord';;
             youtube) continue;;
             *) items=$item;;
         esac
@@ -92,14 +92,7 @@ preflight() {
     fi
     if [ -x /etc/init.d/zapret2 ]; then
         [ -f /opt/zapret2/init.d/openwrt/uci2config ] || die 'Нужна UCI-сборка zapret2 из manager/Routerich.'
-        # Existing foreign strategies/custom scripts are not silently overwritten or disabled.
-        if uci show zapret2 | grep -q '=strategy'; then
-            [ -f "$OWN/owner" ] && [ "$(cat "$OWN/owner")" = zapret2-youtube-autotune ] || die 'Имеется чужая стратегия zapret2. Сначала сохраните/уберите её вручную; автоматическая перезапись запрещена.'
-            for s in $(uci show zapret2 | sed -n 's/^zapret2\.\([^=]*\)=strategy$/\1/p'); do
-                case "$s" in yta_main|yta_api|yta_quic) ;; *) die "Есть чужая стратегия $s.";; esac
-            done
-        fi
-        [ "$(uci -q get zapret2.main.custom_scripts || echo 0)" != 1 ] || die 'Включены сторонние custom.d-скрипты. Автоматически они не отключаются.'
+        say 'Прежние стратегии и custom.d будут сохранены в backup и отключены перед тестами.'
     else
         [ -x /opt/zapret-manager-luci/backend.sh ] || die 'Установите Zapret Manager или его UCI-пакет zapret2.'
     fi
@@ -133,6 +126,10 @@ backup() {
         /etc/init.d/zapret2 enabled >/dev/null 2>&1 && printf '1\n' > "$BACKUP/was-enabled" || true
     fi
     [ ! -d "$OWN" ] || tar -czf "$BACKUP/owned-hostlists.tar.gz" -C /etc zapret2-youtube-autotune
+    # Files are not removed; archive custom hooks as well as their UCI enable flag.
+    if [ -d /opt/zapret2/init.d/custom.d ]; then
+        tar -czf "$BACKUP/custom.d.tar.gz" -C /opt/zapret2/init.d custom.d
+    fi
     sha256sum /etc/config/network /etc/config/firewall > "$BACKUP/recovery.sha256"
     sha256sum /etc/config/podkop > "$BACKUP/podkop.before.sha256"
     opkg list-installed > "$BACKUP/packages.before"
@@ -269,17 +266,40 @@ WRAPPER
     chmod 700 "$RUN/curl-wrapper"
 }
 
+clear_zapret_strategies() {
+    # Re-query after each deletion: anonymous UCI section indices shift.
+    while :; do
+        old=$(uci show zapret2 | sed -n 's/^zapret2\.\([^=]*\)=strategy$/\1/p' | head -n 1)
+        [ -n "$old" ] || break
+        uci delete "zapret2.$old"
+    done
+    uci set zapret2.main.enabled=0
+    uci set zapret2.main.custom_scripts=0
+}
+
+prepare_community_lists() {
+    # A second section with Russia Inside would still capture YouTube/FakeIP.
+    for pod_section in $(uci show podkop | sed -n 's/^podkop\.\([^=]*\)=section$/\1/p'); do
+        lists=$(uci -q get "podkop.$pod_section.community_lists" || true)
+        case " $lists " in
+            *' russia_inside '*|*' youtube '*) ;;
+            *) continue;;
+        esac
+        new=$(expanded_lists $lists)
+        uci -q delete "podkop.$pod_section.community_lists" || true
+        for item in $new; do uci add_list "podkop.$pod_section.community_lists=$item"; done
+        say "Podkop $pod_section: Russia Inside/YouTube заменены; списки: ${new:-нет}."
+    done
+}
+
 prepare_podkop() {
     CHANGED=1
     : > "$BACKUP/podkop-touched"
     /etc/init.d/zapret2 stop > "$BACKUP/stop-zapret2.log" 2>&1
     pidof nfqws2 >/dev/null && die 'Остался посторонний nfqws2: измерения смешались бы.'
-    uci set zapret2.main.enabled=0
-    lists=$(uci -q get "podkop.$SECTION.community_lists" || true)
-    new=$(expanded_lists $lists)
-    [ -n "$new" ] || die 'После удаления YouTube список пуст; настройте остальные сервисы вручную.'
-    uci -q delete "podkop.$SECTION.community_lists" || true
-    for item in $new; do uci add_list "podkop.$SECTION.community_lists=$item"; done
+    clear_zapret_strategies
+    say 'Прежние стратегии убраны из активной UCI-конфигурации; custom.d выключены, файлы сохранены.'
+    prepare_community_lists
     # Staged UCI changes: a power loss before final commit leaves the original Podkop file.
     /usr/bin/podkop reload > "$BACKUP/prepare-podkop.log" 2>&1
     # Supported Podkop reload must not have committed the staged routing configuration.
@@ -288,13 +308,17 @@ prepare_podkop() {
     sing-box check -c /etc/sing-box/config.json
     nft list table inet PodkopTable >/dev/null
     for host in www.youtube.com i.ytimg.com youtubei.googleapis.com; do
-        ips=$(printf '%s\n' "$host" | /opt/zapret2/mdig/mdig --family=4)
-        [ -n "$ips" ] || die "Нет DNS для $host."
-        if printf '%s\n' "$ips" | grep -Eq '(^|[[:space:]])198\.(18|19)\.'; then
-            die "Остался FakeIP для $host; проверьте дополнительные секции/пользовательские списки. Они не удалялись."
-        fi
+        dns_ready=0
+        for attempt in 1 2 3 4 5; do
+            ips=$(printf '%s\n' "$host" | /opt/zapret2/mdig/mdig --family=4) || ips=
+            if [ -n "$ips" ] && ! printf '%s\n' "$ips" | grep -Eq '(^|[[:space:]])198\.(18|19)\.'; then
+                dns_ready=1; break
+            fi
+            sleep 2
+        done
+        [ "$dns_ready" = 1 ] || die "Нет реального DNS для $host после замены Russia Inside/YouTube во всех секциях. Проверьте пользовательские/удалённые списки; выполняется возврат."
     done
-    say 'YouTube временно исключён из выбранной VPN-секции; остальные секции сохранены.'
+    say 'YouTube исключён из community-списков Podkop; остальные параметры секций сохранены.'
 }
 
 scan() {
