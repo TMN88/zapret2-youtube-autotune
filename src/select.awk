@@ -4,7 +4,7 @@ function safe(s,    n,a,i) {
     if (s == "" || s ~ /[^A-Za-z0-9_.,:+=\/@ -]/) return 0
     n=split(s,a,/ +/)
     for(i=1;i<=n;i++) {
-        if(a[i] ~ /^--payload=tls_client_hello$/) continue
+        if(a[i] ~ /^--payload=(tls_client_hello|quic_initial)$/) continue
         if(a[i] ~ /^--lua-desync=[A-Za-z0-9_.,:+=\/@-]+$/) continue
         if(a[i] ~ /^--(out-range|in-range|out-seq|in-seq)=[A-Za-z0-9_.,:+=-]+$/) continue
         return 0

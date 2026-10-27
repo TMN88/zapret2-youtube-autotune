@@ -49,7 +49,8 @@ class TransactionTests(unittest.TestCase):
                 'prepare_blockcheck; . "$RUN/bc/blockcheck2.d/discover/00-yta.sh"; '
                 'pktws_curl_test() { echo real-trial; return 0; }; '
                 'unprepare_all() { echo cleaned; }; '
-                'YTA_OK=7; pktws_curl_test_update tls youtube --lua-desync=multisplit:pos=1; echo unreachable')
+                'YTA_TCPSEG=3; YTA_MULTI=2; YTA_FAKE=3; '
+                'pktws_curl_test_update tls youtube --lua-desync=multisplit:pos=1; echo unreachable')
             self.assertEqual(r.returncode,0,r.stderr)
             self.assertEqual(r.stdout.splitlines(),['real-trial','cleaned'])
 
@@ -118,6 +119,7 @@ class TransactionTests(unittest.TestCase):
             script=core.split("<<'ROLLBACK'\n",1)[1].split('\nROLLBACK',1)[0]
             script=script.replace('[ "$(id -u)" = 0 ] || exit 1', ':')
             script=script.replace('/etc/init.d/zapret2',f'sh "{service.as_posix()}"')
+            script=script.replace('/etc/init.d/youtube-failover',(p/'monitor-service.sh').as_posix())
             script=script.replace('/etc/zapret2-youtube-autotune',own.as_posix())
             (p/'rollback.sh').write_text(script,encoding='utf-8')
             for _ in range(2):

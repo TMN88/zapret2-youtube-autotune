@@ -1,7 +1,7 @@
 #!/bin/sh
 # MIT. Uses the installed Blockcheck2; does not install/replace zapret2.
 set -eu
-VERSION=2.0.0
+VERSION=3.0.0
 BASE=/opt/zapret2
 OWN=/etc/zapret2-youtube-autotune
 LOCK=/var/lock/zapret2-youtube-autotune.lock
@@ -18,9 +18,17 @@ CHANGED=0
 SUCCESS=0
 LOCK_HELD=0
 MEDIA_FILE=
+CACHED=0
+QUIC_MODE=auto
+QUIC_ARGS=
+MONITOR=1
+REFRESH=0
+FAIL_COUNT=/tmp/yta-failover-count
+LAST_SWITCH=/tmp/yta-last-switch
+MON_STATUS=/tmp/yta-monitor.status
 
 say() { printf '%s\n' "$*"; }
-die() { say "Ошибка: $*" >&2; exit 1; }
+die() { printf '\033[1;91mОшибка: %s\033[0m\n' "$*" >&2; exit 1; }
 valid_name() { case "$1" in ''|*[!A-Za-z0-9_]*) return 1;; esac; }
 banner() {
     printf '\033[1;97;41m ОБЯЗАТЕЛЬНАЯ РУЧНАЯ ПОДГОТОВКА ДО ЗАПУСКА \033[0m\n'
@@ -32,15 +40,20 @@ banner() {
 }
 help() {
     cat <<'HELP'
-YouTube Autotune 2: OpenWrt 24/25, installed native Blockcheck2.
+YouTube Autotune 3: OpenWrt 24.10/25.12, installed native Blockcheck2.
 sh install.sh [--want 2|3] [--base /opt/zapret2] [--wan-network wan]
   --scan-seconds N        Discovery time limit per pass (default 1800).
   --media-url-file FILE   Optional fresh HTTPS googlevideo media URL from this WAN.
   --check                Read-only prerequisites, no network tests.
+  --refresh              Ignore the 24-hour WAN/engine-scoped result cache.
+  --no-quic              Skip optional QUIC discovery (default: auto if HTTP3 exists).
+  --no-failover          Do not enable the local failover service.
+  --status               Show the installed monitor status and active TCP strategy.
   --rollback BACKUP      Restore the original stopped service and configuration.
   --help | --version
-Default: find and independently verify 2–3 IPv4 TCP/TLS alternatives, enable one.
-TLS 1.2 + 1.3; no HTTP3 download, QUIC claim, Podkop changes or package installation.
+Default: one verified alternative per TCP Segmentation / Multi / Fake-Seqovl family.
+One active, up to two reserves; local procd failover. Optional verified QUIC only if needed.
+TLS 1.2 + 1.3; no HTTP3 downloads, Podkop changes or package installation.
 Supports Routerich/Manager UCI and official shell configuration; unknown layouts fail closed.
 HELP
 }
@@ -49,7 +62,9 @@ preflight() {
     [ "$(id -u)" = 0 ] || die 'Запустите от root.'
     [ -f /etc/openwrt_release ] || die 'Это не OpenWrt.'
     . /etc/openwrt_release
-    case "$DISTRIB_RELEASE" in 24.*|25.*) ;; *) die 'Поддерживаются OpenWrt 24/25.';; esac
+    case "$DISTRIB_RELEASE" in 24.10*|25.12*) ;; *) die 'Поддерживаются OpenWrt 24.10/25.12.';; esac
+    available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    [ "${available_kb:-0}" -ge 32000 ] || die 'Для подбора недостаточно RAM (нужно 32 МБ MemAvailable).'
     for cmd in uci curl awk sed sort cmp sha256sum setsid nft ubus jsonfilter tar; do
         command -v "$cmd" >/dev/null || die "Нет $cmd. Установите недостающую зависимость вручную (opkg на 24 / apk на 25)."
     done
@@ -83,14 +98,16 @@ preflight() {
 }
 
 guard_reserved_sections() {
-    for key in yta_1 yta_2 yta_3 yta_hosts; do
+    for key in yta_1 yta_2 yta_3 yta_hosts yta_quic; do
         if uci -q get "zapret2.$key" >/dev/null && [ ! -f "$OWN/owner" ]; then die "UCI $key уже существует."; fi
     done
 }
 
 backup() {
-    mkdir -p /var/lock
-    mkdir "$LOCK" 2>/dev/null || die "Есть активный/незавершённый запуск: $LOCK. Проверьте его backup перед повторным запуском."
+    mkdir -p "$(dirname "$LOCK")"
+    if [ "$LOCK_HELD" = 0 ]; then
+        mkdir "$LOCK" 2>/dev/null || die "Есть активный/незавершённый запуск: $LOCK. Проверьте его backup перед повторным запуском."
+    fi
     LOCK_HELD=1
     umask 077
     printf '%s\n' "$$" > "$LOCK/pid"
@@ -102,6 +119,16 @@ backup() {
     printf '%s\n' "$BASE" > "$BACKUP/base-path"
     printf '%s\n' "$LAYOUT" > "$BACKUP/layout"
     cp -p "$CONFIG" "$BACKUP/original-config"
+    printf '0\n' > "$BACKUP/was-running"
+    pidof nfqws2 >/dev/null 2>&1 && printf '1\n' > "$BACKUP/was-running" || true
+    printf '0\n' > "$BACKUP/monitor-running"
+    if [ -f /etc/init.d/youtube-failover ]; then
+        cp -p /etc/init.d/youtube-failover "$BACKUP/monitor-service"
+        printf '0\n' > "$BACKUP/monitor-enabled"
+        /etc/init.d/youtube-failover enabled >/dev/null 2>&1 && printf '1\n' > "$BACKUP/monitor-enabled" || true
+        /etc/init.d/youtube-failover running >/dev/null 2>&1 && printf '1\n' > "$BACKUP/monitor-running" || true
+        if [ "$MODE" = autotune ]; then /etc/init.d/youtube-failover stop; fi
+    fi
     # UCI services may regenerate BASE/config; preserve it separately, too.
     if [ -f "$BASE/config" ]; then cp -p "$BASE/config" "$BACKUP/base-config"; fi
     printf '0\n' > "$BACKUP/was-enabled"
@@ -115,10 +142,16 @@ b=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 [ "$(id -u)" = 0 ] || exit 1
 c=$(cat "$b/config-path"); base=$(cat "$b/base-path")
 /etc/init.d/zapret2 stop >/dev/null 2>&1 || true
+if [ ! -f "$b/from-monitor" ]; then
+    [ ! -x /etc/init.d/youtube-failover ] || /etc/init.d/youtube-failover stop >/dev/null 2>&1 || true
+fi
 if [ "$(cat "$b/layout")" = uci ]; then uci -q revert zapret2 || true; fi
 cp -p "$b/original-config" "$c"
 if [ -f "$b/base-config" ]; then cp -p "$b/base-config" "$base/config"; fi
 rm -f /etc/zapret2-youtube-autotune/youtube.txt /etc/zapret2-youtube-autotune/owner
+for f in control.sh runtime.conf active active.sha256 cache-context cache-time cache.sha256 quic.txt; do
+    rm -f "/etc/zapret2-youtube-autotune/$f"
+done
 for n in 1 2 3; do rm -f "/etc/zapret2-youtube-autotune/strategy-$n.txt"; done
 if [ -f "$b/owned.tar.gz" ]; then
     tar -xzf "$b/owned.tar.gz" -C /etc
@@ -128,8 +161,23 @@ else
     for n in 1 2 3; do rm -f "/etc/zapret2-youtube-autotune/strategy-$n.txt"; done
     rmdir /etc/zapret2-youtube-autotune 2>/dev/null || true
 fi
+if [ ! -f "$b/owned.tar.gz" ]; then
+    for f in control.sh runtime.conf active active.sha256 cache-context cache-time cache.sha256 quic.txt; do
+        rm -f "/etc/zapret2-youtube-autotune/$f"
+    done
+    rmdir /etc/zapret2-youtube-autotune 2>/dev/null || true
+fi
 if [ "$(cat "$b/was-enabled")" = 1 ]; then /etc/init.d/zapret2 enable; else /etc/init.d/zapret2 disable; fi
-printf 'Исходная конфигурация восстановлена; zapret2 остановлен, как перед подбором.\n'
+if [ -f "$b/was-running" ] && [ "$(cat "$b/was-running")" = 1 ]; then /etc/init.d/zapret2 start; fi
+if [ -f "$b/monitor-service" ]; then
+    cp -p "$b/monitor-service" /etc/init.d/youtube-failover
+    if [ "$(cat "$b/monitor-enabled")" = 1 ]; then /etc/init.d/youtube-failover enable; else /etc/init.d/youtube-failover disable; fi
+    if [ "$(cat "$b/monitor-running")" = 1 ]; then /etc/init.d/youtube-failover start; fi
+else
+    [ ! -x /etc/init.d/youtube-failover ] || /etc/init.d/youtube-failover disable
+    rm -f /etc/init.d/youtube-failover
+fi
+printf 'Исходная конфигурация и состояние служб восстановлены.\n'
 ROLLBACK
     chmod 700 "$BACKUP/rollback.sh"
     # Survives a killed parent. Never restores over a detected concurrent edit.
@@ -149,6 +197,9 @@ if [ -f "$b/scan-pid" ]; then
 fi
 if [ -f "$b/changed" ] && [ ! -f "$b/conflict" ] && [ ! -f "$b/finished" ]; then
     sh "$b/rollback.sh" > "$b/watchdog.log" 2>&1 || exit 1
+fi
+if [ ! -f "$b/changed" ] && [ ! -f "$b/finished" ] && [ -f "$b/monitor-service" ] && [ "$(cat "$b/monitor-running")" = 1 ]; then
+    /etc/init.d/youtube-failover start >> "$b/watchdog.log" 2>&1 || exit 1
 fi
 if [ "$(cat /var/lock/zapret2-youtube-autotune.lock/pid 2>/dev/null)" = "$parent" ]; then
     rm -f /var/lock/zapret2-youtube-autotune.lock/pid /var/lock/zapret2-youtube-autotune.lock/backup
@@ -180,12 +231,18 @@ cleanup() {
     if [ "$SUCCESS" != 1 ] && [ "$CHANGED" = 1 ]; then
         if [ -f "$BACKUP/conflict" ]; then
             say "Параллельные изменения: автоматическая перезапись остановлена. Backup: $BACKUP" >&2
-        elif ! sh "$BACKUP/rollback.sh"; then
+        else
+          printf '\033[1;93mПодбор/переключение не завершено — выполняется откат.\033[0m\n' >&2
+          if ! sh "$BACKUP/rollback.sh"; then
             say "Автовозврат не завершён: sh $BACKUP/rollback.sh" >&2
             exit 1
+          fi
         fi
     fi
-    [ ! -d "$BACKUP" ] || : > "$BACKUP/finished"
+    if [ -d "$BACKUP" ]; then
+        if [ "$SUCCESS" != 1 ] && [ "$CHANGED" = 0 ] && [ -f "$BACKUP/monitor-service" ] && [ "$(cat "$BACKUP/monitor-running")" = 1 ]; then /etc/init.d/youtube-failover start; fi
+        : > "$BACKUP/finished"
+    fi
     [ -z "$WATCH_PID" ] || kill "$WATCH_PID" 2>/dev/null || true
     if [ "$LOCK_HELD" = 1 ]; then rm -f "$LOCK/pid" "$LOCK/backup"; rmdir "$LOCK" 2>/dev/null || true; fi
     exit "$rc"
@@ -213,14 +270,22 @@ prepare_blockcheck() {
     cat > "$RUN/bc/blockcheck2.d/discover/00-yta.sh" <<'HOOK'
 pktws_curl_test_update()
 {
-    local yta_code
+    local yta_code family count
+    case " $* " in
+        *--payload=quic_initial*) family=quic; count=${YTA_QUIC:-0};;
+        *seqovl=*|*--lua-desync=fake:*) family=fake; count=${YTA_FAKE:-0};;
+        *--lua-desync=tcpseg:*) family=tcpseg; count=${YTA_TCPSEG:-0};;
+        *--lua-desync=multisplit:*|*--lua-desync=multidisorder:*) family=multi; count=${YTA_MULTI:-0};;
+        *) return 1;;
+    esac
+    [ "$count" -lt 3 ] || return 0
     pktws_curl_test "$@"; yta_code=$?
     if [ "$yta_code" = 0 ]; then
         shift; shift
         strategy="${strategy:-$*}"
         # Only successes are counted; the outer parser also checks all attempts.
-        YTA_OK=$((${YTA_OK:-0}+1))
-        if [ "$YTA_OK" -ge 8 ]; then unprepare_all; exit 0; fi
+        case "$family" in tcpseg) YTA_TCPSEG=$((count+1));; multi) YTA_MULTI=$((count+1));; fake) YTA_FAKE=$((count+1));; quic) YTA_QUIC=$((count+1));; esac
+        if [ "${YTA_QUIC:-0}" -ge 3 ] || { [ "${YTA_TCPSEG:-0}" -ge 3 ] && [ "${YTA_MULTI:-0}" -ge 3 ] && [ "${YTA_FAKE:-0}" -ge 3 ]; }; then unprepare_all; exit 0; fi
     fi
     return "$yta_code"
 }
@@ -243,9 +308,9 @@ scan() {
       NFQWS2="$BASE/nfq2/nfqws2" MDIG="$BASE/mdig/mdig" SIMULATE=0 SKIP_PKTWS=0 \
       CURL="$RUN/curl-wrapper" TEST="$test" DOMAINS="$(cat "$targets")" BATCH=1 IPVS=4 \
       SCANLEVEL=force PARALLEL=0 REPEATS="$REPEATS" FWTYPE=nftables \
-      LIST_HTTPS_TLS13="$RUN/candidates" LIST_HTTPS_TLS12="$RUN/candidates" \
+      LIST_HTTPS_TLS13="$RUN/candidates" LIST_HTTPS_TLS12="$RUN/candidates" LIST_QUIC="$RUN/candidates" \
       ENABLE_HTTP=0 ENABLE_HTTPS_TLS12="$([ "$proto" = tls12 ] && echo 1 || echo 0)" \
-      ENABLE_HTTPS_TLS13="$([ "$proto" = tls13 ] && echo 1 || echo 0)" ENABLE_HTTP3=0 \
+      ENABLE_HTTPS_TLS13="$([ "$proto" = tls13 ] && echo 1 || echo 0)" ENABLE_HTTP3="$([ "$proto" = quic ] && echo 1 || echo 0)" \
       SECURE_DNS=1 SKIP_DNSCHECK=1 SKIP_IPBLOCK=1 DOH_SERVER=https://dns.google/dns-query \
       CURL_MAX_TIME=8 CURL_MAX_TIME_DOH=8 CURL_HTTPS_GET=1 PACE=300 \
       setsid sh "$RUN/bc/blockcheck2.sh" > "$log" 2>&1 &
@@ -272,6 +337,7 @@ select_log() {
 }
 
 choose() {
+    if [ "$REFRESH" = 0 ] && cache_load; then CACHED=1; say 'Используются сохранённые результаты (тот же WAN/движок, не старше 24 часов).'; return; fi
     printf '%s\n' www.youtube.com > "$RUN/discovery-target"
     : > "$RUN/candidates"
     scan discover-tls13 discover tls13 "$RUN/discovery-target"
@@ -280,14 +346,18 @@ choose() {
     : > "$RUN/selected"
     if [ -s "$RUN/candidates" ]; then verify_candidates primary; fi
     # Fallback only when the verified pool is short; never re-test old candidates.
-    if [ "$(wc -l < "$RUN/selected")" -lt "$WANT" ]; then
+    if [ "$(family_count "$RUN/selected")" -lt "$WANT" ]; then
         cp "$RUN/candidates" "$RUN/tried"
         scan discover-tls12 discover tls12 "$RUN/discovery-target"
         select_log "$BACKUP/discover-tls12.log" "$RUN/discovery-target" curl_test_https_tls12 1 > "$RUN/extra" || true
         awk 'FILENAME==ARGV[1] {seen[$0]=1; next} !seen[$0]++' "$RUN/tried" "$RUN/extra" > "$RUN/candidates"
         if [ -s "$RUN/candidates" ]; then verify_candidates fallback; fi
     fi
-    [ "$(wc -l < "$RUN/selected")" -ge 2 ] || die 'Меньше двух независимых стратегий прошли все цели и оба TLS. Конфигурация не менялась.'
+    validated_count=$(family_count "$RUN/selected")
+    if [ "$validated_count" -lt 2 ]; then
+        printf '\033[1;91mПодтверждено TCP/TLS: %s из 3 | Применено: 0\033[0m\n' "$validated_count"
+        die 'Меньше двух разных семейств прошли все цели и оба TLS. Конфигурация не менялась.'
+    fi
 }
 
 verify_candidates() {
@@ -330,6 +400,7 @@ stage_profile() {
         uci set "zapret2.main.openwrt_wan4=$WAN_NETWORK"
         uci set zapret2.main.flowoffload=donttouch
         uci set zapret2.main.disable_ipv6=1
+        stage_quic
         uci changes zapret2 > "$BACKUP/planned.changes"
     else
         cp -p "$BACKUP/original-config" "$RUN/config.new"
@@ -339,8 +410,8 @@ stage_profile() {
 # YouTube Autotune: one independently verified alternative
 NFQWS2_ENABLE=1
 NFQWS2_PORTS_TCP=443
-NFQWS2_PORTS_UDP=
-NFQWS2_OPT='--filter-tcp=443 --filter-l7=tls --hostlist=$OWN/youtube.txt $args'
+NFQWS2_PORTS_UDP='${QUIC_ARGS:+443}'
+NFQWS2_OPT='--filter-tcp=443 --filter-l7=tls --hostlist=$OWN/youtube.txt $args ${QUIC_ARGS:+--new --filter-udp=443 --filter-l7=quic --hostlist=$OWN/youtube.txt $QUIC_ARGS}'
 DISABLE_CUSTOM=1
 DISABLE_IPV6=1
 MODE_FILTER=none
@@ -357,7 +428,7 @@ probe() {
     p_metrics=$(curl --interface "$WAN_DEV" --noproxy '*' -4 --http1.1 \
       --connect-timeout 5 --max-time 20 -sS -o /dev/null \
       -w '%{http_code} %{size_download}' "https://$p_target") || return 1
-    printf '%s %s\n' "$p_target" "$p_metrics" >> "$BACKUP/installed-verification.log"
+    [ -z "$BACKUP" ] || printf '%s %s\n' "$p_target" "$p_metrics" >> "$BACKUP/installed-verification.log"
     set -- $p_metrics
     case "$p_expected:$1" in 200:200|endpoint:200|endpoint:404|endpoint:405) ;; *) return 1;; esac
     awk -v actual="$2" -v minimum="$p_min" 'BEGIN {exit !(actual>=minimum)}'
@@ -395,21 +466,27 @@ prepare_media() {
 apply_profiles() {
     assert_unchanged
     CHANGED=1; : > "$BACKUP/changed"
+    if [ "$CACHED" = 1 ] && [ -s "$OWN/quic.txt" ]; then cp "$OWN/quic.txt" "$BACKUP/cached-quic.txt"; fi
     mkdir -p "$OWN"
+    rm -f "$OWN/quic.txt"
     printf 'zapret2-youtube-autotune\n' > "$OWN/owner"
     printf '%s\n' youtube.com youtu.be ytimg.com googlevideo.com youtubei.googleapis.com youtube.googleapis.com > "$OWN/youtube.txt"
     chmod 755 "$OWN"; chmod 644 "$OWN/youtube.txt"
     accepted=0; trial=0
+    : > "$RUN/accepted-families"
     while IFS= read -r args; do
+        chosen_family=$(strategy_family "$args")
+        grep -qx "$chosen_family" "$RUN/accepted-families" && continue
         trial=$((trial+1))
         "$BASE/nfq2/nfqws2" --dry-run --qnum=300 \
           "--lua-init=@$BASE/lua/zapret-lib.lua" "--lua-init=@$BASE/lua/zapret-antidpi.lua" \
           --filter-tcp=443 --filter-l7=tls "--hostlist=$OWN/youtube.txt" $args > "$BACKUP/dry-run-$trial.log" 2>&1 || continue
         n=$((accepted+1))
+        passed=0
+        if [ "$CACHED" = 1 ]; then passed=1; else
         assert_unchanged
         stage_profile "$n" "$args"
         /etc/init.d/zapret2 start > "$BACKUP/start-$trial.log" 2>&1 || die 'Не удалось запустить zapret2.'
-        passed=0
         sleep 2
         if pidof nfqws2 >/dev/null && verify_installed; then passed=1; fi
         /etc/init.d/zapret2 stop >> "$BACKUP/start-$trial.log" 2>&1 || die 'Не удалось остановить пробный профиль.'
@@ -420,14 +497,19 @@ apply_profiles() {
             cmp -s "$RUN/current.changes" "$BACKUP/planned.changes" || { : > "$BACKUP/conflict"; die 'Параллельные UCI-изменения.'; }
             uci revert zapret2
         fi
+        fi
         if [ "$passed" = 1 ]; then
             accepted=$n
+            printf '%s\n' "$chosen_family" >> "$RUN/accepted-families"
             printf '%s\n' "$args" > "$BACKUP/strategy-$n.txt"
             say "Стратегия $n прошла независимую проверку через службу."
         fi
         [ "$accepted" -lt "$WANT" ] || break
     done < "$RUN/selected"
-    [ "$accepted" -ge 2 ] || die 'Через службу прошли меньше двух стратегий; откат.'
+    if [ "$accepted" -lt 2 ]; then
+        printf '\033[1;91mПодтверждено через службу: %s | Итоговое применение: 0 — откат\033[0m\n' "$accepted"
+        die 'Через службу прошли меньше двух стратегий; откат.'
+    fi
     for n in 1 2 3; do
         rm -f "$OWN/strategy-$n.txt"
         [ ! -f "$BACKUP/strategy-$n.txt" ] || cp "$BACKUP/strategy-$n.txt" "$OWN/strategy-$n.txt"
@@ -444,12 +526,16 @@ apply_profiles() {
     /etc/init.d/zapret2 start > "$BACKUP/final-start.log" 2>&1 || die 'Не удалось включить итоговую стратегию.'
     sleep 2
     pidof nfqws2 >/dev/null || die 'Итоговая стратегия не запущена.'
+    if [ "$CACHED" = 1 ]; then verify_installed || die 'Сохранённая активная стратегия не прошла текущую проверку; откат. Повторите с --refresh.'; fi
     /etc/init.d/zapret2 enable
+    sha256sum "$CONFIG" > "$BACKUP/config.sha256"
+    configure_quic
+    install_runtime
     SUCCESS=1
     : > "$BACKUP/finished"
-    say "Готово: $accepted разных проверенных стратегий, включена только первая."
+    print_results "$accepted"
     say "Стратегии: $OWN/strategy-N.txt; backup и логи: $BACKUP"
-    say 'Проверены IPv4 TCP/TLS, страница, превью и ответы endpoint API/CDN. QUIC/IPv6 не тестировались.'
+    say "Проверены IPv4 TCP/TLS; QUIC: $QUIC_STATUS. Failover: $MONITOR."
     if [ -z "$MEDIA_FILE" ]; then say 'Поток видео не тестировался: для него нужен свежий --media-url-file и проверка на LAN-устройстве.'; fi
 }
 
@@ -457,7 +543,8 @@ main() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --help|-h) help; return;; --version) say "$VERSION"; return;; --check) MODE=check;;
-            --no-quic) :;;
+            --no-quic) QUIC_MODE=off;; --refresh) REFRESH=1;; --no-failover) MONITOR=0;;
+            --monitor-loop|--failover-once|--status) runtime_main "$1"; return;;
             --base|--wan-network|--want|--scan-seconds|--media-url-file)
                 [ "$#" -ge 2 ] || die "Нет значения $1"
                 opt=$1; shift
@@ -488,6 +575,273 @@ main() {
     apply_profiles
 }
 
+# Family-aware result cache and local OpenWrt procd failover. No external scheduler.
+print_results() {
+    result_count=$1
+    printf '\n\033[1;97;42m РЕЗУЛЬТАТ YOUTUBE AUTOTUNE \033[0m\n'
+    printf '\033[1;92mПодтверждено TCP/TLS: %s из 3 семейств\033[0m\n' "$result_count"
+    printf '\033[1;96mПрименено TCP/TLS: 1 | Резервных: %s\033[0m\n' "$((result_count-1))"
+    for result_n in 1 2 3; do
+        [ -s "$OWN/strategy-$result_n.txt" ] || continue
+        result_family=$(strategy_family "$(cat "$OWN/strategy-$result_n.txt")")
+        case "$result_family" in tcpseg) result_label='TCP Segmentation';; multi) result_label='Multisplit/Multidisorder';; fake) result_label='Fake TLS/Seqovl';; esac
+        if [ "$result_n" = 1 ]; then printf '\033[1;92m  %s. %s — АКТИВНА\033[0m\n' "$result_n" "$result_label";
+        else printf '\033[1;96m  %s. %s — РЕЗЕРВ\033[0m\n' "$result_n" "$result_label"; fi
+    done
+    if [ "$QUIC_STATUS" = verified ]; then printf '\033[1;92mQUIC: отдельно проверена и применена 1 UDP-стратегия\033[0m\n';
+    else printf '\033[1;93mQUIC: не применена (%s)\033[0m\n' "$QUIC_STATUS"; fi
+    if [ "$MONITOR" = 1 ]; then printf '\033[1;92mFailover: включён (3 сбоя → проверка резерва → переключение)\033[0m\n';
+    else printf '\033[1;93mFailover: выключен\033[0m\n'; fi
+    if [ "$result_count" -lt 3 ]; then printf '\033[1;93mТретье семейство не подтверждено; непроверенная стратегия не добавлена.\033[0m\n'; fi
+    if [ "$CACHED" = 1 ]; then printf '\033[1;93mИспользован сохранённый результат; активная стратегия проверена сейчас.\033[0m\n'; fi
+}
+strategy_family() {
+    case "$1" in
+        *seqovl=*|*--lua-desync=fake:*) echo fake;;
+        *--lua-desync=tcpseg:*) echo tcpseg;;
+        *--lua-desync=multisplit:*|*--lua-desync=multidisorder:*) echo multi;;
+        *) echo unknown;;
+    esac
+}
+family_count() {
+    awk '/seqovl=|--lua-desync=fake:/ {a["fake"]=1;next} /--lua-desync=tcpseg:/ {a["tcpseg"]=1;next} /--lua-desync=multisplit:|--lua-desync=multidisorder:/ {a["multi"]=1} END {for(k in a)n++; print n+0}' "$1"
+}
+cache_context() {
+    {
+        printf '%s\n' 'youtube-families-tls12-tls13-v3' "$BASE" "$LAYOUT" "$WAN_NETWORK" "$WAN_DEV"
+        cat /etc/openwrt_release
+        sha256sum "$BASE/blockcheck2.sh" "$BASE/nfq2/nfqws2" "$BASE/blockcheck2.d/standard/"*.sh "$BASE/blockcheck2.d/standard/def.inc"
+        curl --version
+        ubus call "network.interface.$WAN_NETWORK" status | jsonfilter -e '@["ipv4-address"][0].address' -e '@.route[*].nexthop'
+    } | sha256sum | awk '{print $1}'
+}
+cache_load() {
+    [ -f "$OWN/cache-time" ] && [ -f "$OWN/cache.sha256" ] && [ -f "$OWN/cache-context" ] || return 1
+    cached_time=$(cat "$OWN/cache-time"); now=$(date +%s)
+    case "$cached_time" in ''|*[!0-9]*) return 1;; esac
+    age=$((now-cached_time))
+    [ "$age" -ge 0 ] && [ "$age" -le 86400 ] || return 1
+    [ "$(cache_context)" = "$(cat "$OWN/cache-context")" ] || return 1
+    sha256sum -c "$OWN/cache.sha256" >/dev/null 2>&1 || return 1
+    : > "$RUN/selected"
+    for index in 1 2 3; do [ ! -s "$OWN/strategy-$index.txt" ] || cat "$OWN/strategy-$index.txt" >> "$RUN/selected"; done
+    [ "$(family_count "$RUN/selected")" -ge 2 ]
+}
+
+stage_quic() {
+    uci -q delete zapret2.yta_quic || true
+    [ -n "$QUIC_ARGS" ] || return 0
+    uci set zapret2.yta_quic=strategy
+    uci set zapret2.yta_quic.enabled=1
+    uci set zapret2.yta_quic.port=443
+    uci add_list zapret2.yta_quic.protocol=udp
+    uci add_list zapret2.yta_quic.filter_l3=ipv4
+    uci add_list zapret2.yta_quic.filter_l7=quic
+    uci add_list zapret2.yta_quic.hostlist=yta_hosts
+    uci set "zapret2.yta_quic.script=$QUIC_ARGS"
+    uci set zapret2.main.nfqws_ports_udp=443
+}
+quic_probe() {
+    q=$(curl --interface "$WAN_DEV" --noproxy '*' -4 --http3-only --connect-timeout 5 --max-time 12 \
+      -sS -o /dev/null -w '%{http_code} %{size_download} %{http_version}' https://www.youtube.com/) || return 1
+    set -- $q
+    [ "$#" = 3 ] || return 1
+    [ "$1" = 200 ] && [ "$3" = 3 ] && awk -v bytes="$2" 'BEGIN {exit !(bytes>=10000)}'
+}
+configure_quic() {
+    QUIC_STATUS=not_needed
+    if [ "$QUIC_MODE" = off ]; then QUIC_STATUS=disabled; return; fi
+    if ! curl --version | grep -q ' HTTP3'; then QUIC_STATUS=unsupported_curl; return; fi
+    # Need means: healthy TCP, HTTP3 available, two direct QUIC failures.
+    if quic_probe; then QUIC_STATUS=direct_ok; return; fi
+    sleep 3
+    if quic_probe; then QUIC_STATUS=direct_ok; return; fi
+    verify_installed || die 'TCP перестал работать перед QUIC; откат.'
+    assert_unchanged
+    /etc/init.d/zapret2 stop
+    printf '%s\n' www.youtube.com > "$RUN/quic-discovery-target"
+    printf '%s\n' www.youtube.com i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg > "$RUN/quic-targets"
+    : > "$RUN/quic-selected"
+    if [ "$CACHED" = 1 ] && [ -s "$BACKUP/cached-quic.txt" ]; then
+        cp "$BACKUP/cached-quic.txt" "$RUN/quic-selected"
+    else
+      : > "$RUN/candidates"
+      scan discover-quic discover quic "$RUN/quic-discovery-target"
+      select_log "$BACKUP/discover-quic.log" "$RUN/quic-discovery-target" curl_test_http3 1 > "$RUN/quic-pool" || true
+      cp "$RUN/quic-pool" "$RUN/candidates"
+      if [ -s "$RUN/candidates" ]; then
+        scan verify-quic verify quic "$RUN/quic-targets"
+        select_log "$BACKUP/verify-quic.log" "$RUN/quic-targets" curl_test_http3 0 > "$RUN/quic-selected" || true
+      fi
+    fi
+    if [ -s "$RUN/quic-selected" ]; then
+        QUIC_ARGS=$(sed -n '1p' "$RUN/quic-selected")
+        if [ "$LAYOUT" = uci ]; then stage_quic; else stage_profile 1 "$(cat "$BACKUP/strategy-1.txt")"; fi
+        /etc/init.d/zapret2 start
+        sleep 2
+        if quic_probe && quic_probe && verify_installed; then
+            if [ "$LAYOUT" = uci ]; then uci commit zapret2; fi
+            printf '%s\n' "$QUIC_ARGS" > "$OWN/quic.txt"
+            sha256sum "$CONFIG" > "$BACKUP/config.sha256"
+            QUIC_STATUS=verified
+            return
+        fi
+        /etc/init.d/zapret2 stop
+    fi
+    QUIC_ARGS=
+    if [ "$LAYOUT" = uci ]; then uci revert zapret2; else stage_profile 1 "$(cat "$BACKUP/strategy-1.txt")"; fi
+    rm -f "$OWN/quic.txt"
+    /etc/init.d/zapret2 start
+    QUIC_STATUS=not_found
+}
+
+install_runtime() {
+    [ "$(readlink -f "$0")" = "$OWN/control.sh" ] || cp "$0" "$OWN/control.sh"
+    chmod 700 "$OWN/control.sh"
+    cat > "$OWN/runtime.conf" <<EOF
+BASE='$BASE'
+LAYOUT='$LAYOUT'
+CONFIG='$CONFIG'
+WAN_NETWORK='$WAN_NETWORK'
+WAN_DEV='$WAN_DEV'
+EOF
+    printf '1\n' > "$OWN/active"
+    sha256sum "$CONFIG" > "$OWN/active.sha256"
+    cache_context > "$OWN/cache-context"
+    if [ "$CACHED" = 0 ]; then date +%s > "$OWN/cache-time"; fi
+    sha256sum "$OWN"/strategy-*.txt > "$OWN/cache.sha256"
+    [ ! -s "$OWN/quic.txt" ] || sha256sum "$OWN/quic.txt" >> "$OWN/cache.sha256"
+    cat > /etc/init.d/youtube-failover <<'SERVICE'
+#!/bin/sh /etc/rc.common
+USE_PROCD=1
+START=96
+start_service() {
+    procd_open_instance
+    procd_set_param command /bin/sh /etc/zapret2-youtube-autotune/control.sh --monitor-loop
+    procd_set_param respawn 3600 5 5
+    procd_close_instance
+}
+SERVICE
+    chmod 755 /etc/init.d/youtube-failover
+    # Cooldown is between switch attempts, not a startup blackout.
+    printf '0\n' > "$LAST_SWITCH"
+    printf '0\n' > "$FAIL_COUNT"
+    if [ "$MONITOR" = 1 ]; then /etc/init.d/youtube-failover enable; /etc/init.d/youtube-failover start;
+    else /etc/init.d/youtube-failover disable; fi
+}
+
+# Health: 0 healthy, 1 plausible bypass failure, 2 inconclusive (never fail over).
+health_probe() {
+    hp_target=$1; hp_min=$2
+    hp_rc=0
+    hp=$(curl --interface "$WAN_DEV" --noproxy '*' -4 --http1.1 --connect-timeout 5 --max-time 12 \
+      -sS -o /dev/null -w '%{http_code} %{size_download}' "https://$hp_target") || hp_rc=$?
+    case "$hp_rc" in 0) ;; 6|5|2|3|4|60|77) return 2;; *) return 1;; esac
+    set -- $hp
+    [ "$#" = 2 ] || return 2
+    case "$1" in 403|429|5??) return 2;; 200) ;; *) return 1;; esac
+    awk -v bytes="$2" -v minimum="$hp_min" 'BEGIN {exit !(bytes>=minimum)}'
+}
+health_round() {
+    h1=0; h2=0
+    health_probe www.youtube.com/ 10000 || h1=$?
+    health_probe i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg 1000 || h2=$?
+    [ "$h1" != 2 ] && [ "$h2" != 2 ] || return 2
+    [ "$h1" = 0 ] && [ "$h2" = 0 ]
+}
+wan_ready() {
+    ws=$(ubus call "network.interface.$WAN_NETWORK" status) || return 1
+    [ "$(printf '%s' "$ws" | jsonfilter -e '@.up')" = true ] || return 1
+    current_dev=$(printf '%s' "$ws" | jsonfilter -e '@.l3_device')
+    [ "$current_dev" = "$WAN_DEV" ]
+}
+monitor_note() { printf '%s %s\n' "$(date +%s)" "$*" > "$MON_STATUS"; }
+monitor_once() {
+    mkdir -p "$(dirname "$LOCK")"
+    mkdir "$LOCK" 2>/dev/null || return 0
+    LOCK_HELD=1; printf '%s\n' "$$" > "$LOCK/pid"
+    trap cleanup EXIT
+    trap 'exit 130' HUP INT TERM
+    # User edits suspend automatic writes; they never get silently replaced.
+    if ! sha256sum -c "$OWN/active.sha256" >/dev/null 2>&1 || [ -n "$(uci changes zapret2)" ]; then monitor_note suspended_config_changed; return; fi
+    if ! wan_ready; then printf '0\n' > "$FAIL_COUNT"; monitor_note inconclusive_wan; return; fi
+    if [ "$(cache_context)" != "$(cat "$OWN/cache-context")" ]; then monitor_note suspended_context_changed; return; fi
+    hc=0; health_round || hc=$?
+    if [ "$hc" = 0 ]; then printf '0\n' > "$FAIL_COUNT"; monitor_note healthy; return; fi
+    if [ "$hc" = 2 ]; then printf '0\n' > "$FAIL_COUNT"; monitor_note inconclusive_dns_or_http; return; fi
+    failures=$(cat "$FAIL_COUNT" 2>/dev/null || echo 0)
+    case "$failures" in ''|*[!0-9]*) failures=0;; esac
+    failures=$((failures+1)); printf '%s\n' "$failures" > "$FAIL_COUNT"
+    monitor_note "failure_$failures"
+    [ "$failures" -ge 3 ] || return 0
+    last=$(cat "$LAST_SWITCH" 2>/dev/null || echo 0)
+    case "$last" in ''|*[!0-9]*) last=0;; esac
+    [ "$(($(date +%s)-last))" -ge 900 ] || return 0
+    sha256sum -c "$OWN/cache.sha256" >/dev/null 2>&1 || { monitor_note suspended_cache_changed; return; }
+    active=$(cat "$OWN/active")
+    case "$active" in 1|2|3) ;; *) monitor_note invalid_active; return;; esac
+    # Durable transaction starts only for a confirmed failure, not on every poll.
+    backup
+    : > "$BACKUP/from-monitor"
+    CHANGED=1; : > "$BACKUP/changed"
+    date +%s > "$LAST_SWITCH"
+    QUIC_ARGS=
+    [ ! -s "$OWN/quic.txt" ] || QUIC_ARGS=$(cat "$OWN/quic.txt")
+    for alternative in 1 2 3; do
+        [ "$alternative" != "$active" ] && [ -s "$OWN/strategy-$alternative.txt" ] || continue
+        assert_unchanged
+        /etc/init.d/zapret2 stop
+        stage_profile "$alternative" "$(cat "$OWN/strategy-$alternative.txt")"
+        /etc/init.d/zapret2 start || die 'Failover: служба не запустилась; откат.'
+        sleep 3
+        good=0
+        if wan_ready && health_round; then sleep 5; if health_round; then good=1; fi; fi
+        sha256sum -c "$BACKUP/config.sha256" >/dev/null || { : > "$BACKUP/conflict"; die 'Failover: параллельная запись конфигурации.'; }
+        if [ "$good" = 1 ]; then
+            if [ "$LAYOUT" = uci ]; then
+                uci changes zapret2 > "$RUN/current.changes"
+                cmp -s "$RUN/current.changes" "$BACKUP/planned.changes" || { : > "$BACKUP/conflict"; die 'Failover: параллельные изменения.'; }
+                sha256sum -c "$BACKUP/config.sha256" >/dev/null || { : > "$BACKUP/conflict"; die 'Failover: параллельная запись.'; }
+                uci commit zapret2
+            fi
+            printf '%s\n' "$alternative" > "$OWN/active"
+            sha256sum "$CONFIG" > "$OWN/active.sha256"
+            printf '0\n' > "$FAIL_COUNT"
+            monitor_note "switched_${active}_to_$alternative"
+            SUCCESS=1
+            return
+        fi
+        /etc/init.d/zapret2 stop
+        if [ "$LAYOUT" = uci ]; then
+            sha256sum -c "$BACKUP/config.sha256" >/dev/null || { : > "$BACKUP/conflict"; die 'Failover: параллельная запись.'; }
+            uci changes zapret2 > "$RUN/current.changes"
+            cmp -s "$RUN/current.changes" "$BACKUP/planned.changes" || { : > "$BACKUP/conflict"; die 'Failover: параллельные изменения.'; }
+            uci revert zapret2
+        else cp -p "$BACKUP/original-config" "$CONFIG"; sha256sum "$CONFIG" > "$BACKUP/config.sha256"; fi
+    done
+    monitor_note no_healthy_reserve_restoring_original
+    die 'Резервы не прошли проверку; восстанавливается исходная стратегия.'
+}
+runtime_main() {
+    [ "$(id -u)" = 0 ] || die 'Запустите от root.'
+    [ -f "$OWN/runtime.conf" ] || die 'Сначала выполните подбор.'
+    . "$OWN/runtime.conf"
+    MODE=monitor
+    case "$1" in
+        --status)
+            say "Активная TCP-стратегия: $(cat "$OWN/active")"
+            cat "$MON_STATUS" 2>/dev/null || true
+            say "QUIC: $([ -s "$OWN/quic.txt" ] && echo verified || echo disabled)";;
+        --failover-once) monitor_once;;
+        --monitor-loop)
+            while :; do
+                # Child process owns each transaction and releases its own lock.
+                sh "$OWN/control.sh" --failover-once || true
+                sleep 60
+            done;;
+    esac
+}
+
 write_assets() {
     cat > "$RUN/select.awk" <<'YTA_SELECT_AWK'
 # Strict native Blockcheck2 parser. SUMMARY and baseline are never trials.
@@ -496,7 +850,7 @@ function safe(s,    n,a,i) {
     if (s == "" || s ~ /[^A-Za-z0-9_.,:+=\/@ -]/) return 0
     n=split(s,a,/ +/)
     for(i=1;i<=n;i++) {
-        if(a[i] ~ /^--payload=tls_client_hello$/) continue
+        if(a[i] ~ /^--payload=(tls_client_hello|quic_initial)$/) continue
         if(a[i] ~ /^--lua-desync=[A-Za-z0-9_.,:+=\/@-]+$/) continue
         if(a[i] ~ /^--(out-range|in-range|out-seq|in-seq)=[A-Za-z0-9_.,:+=-]+$/) continue
         return 0

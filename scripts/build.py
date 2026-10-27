@@ -2,7 +2,8 @@
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
-parts = [root.joinpath('src/core.sh').read_text(encoding='utf-8'), '\nwrite_assets() {\n']
+parts = [root.joinpath('src/core.sh').read_text(encoding='utf-8'), '\n',
+         root.joinpath('src/runtime.sh').read_text(encoding='utf-8'), '\nwrite_assets() {\n']
 for source, target in [('src/select.awk', 'select.awk')]:
     marker = 'YTA_' + target.upper().replace('.', '_').replace('-', '_')
     parts += [f'    cat > "$RUN/{target}" <<\'{marker}\'\n',

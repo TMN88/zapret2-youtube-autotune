@@ -20,13 +20,13 @@ def block(strategy, target='www.youtube.com', attempts=3, fail=None, proto='tls1
 
 
 class SelectionTests(unittest.TestCase):
-    def rank(self, log, candidates=A+'\n', targets='www.youtube.com\n', discover=0):
+    def rank(self, log, candidates=A+'\n', targets='www.youtube.com\n', discover=0, protocol='curl_test_https_tls13'):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d)
             for name, body in [('log', log), ('candidates', candidates), ('targets', targets)]:
                 (p/name).write_text(body, encoding='utf-8')
             return subprocess.run(['awk', '-v', f'targets={(p/"targets").as_posix()}',
-                '-v', 'repeats=3', '-v', 'protocol=curl_test_https_tls13', '-v', f'discover={discover}',
+                '-v', 'repeats=3', '-v', f'protocol={protocol}', '-v', f'discover={discover}',
                 '-f', (ROOT/'src/select.awk').as_posix(), (p/'candidates').as_posix(),
                 (p/'log').as_posix()], text=True, capture_output=True)
 
@@ -38,6 +38,13 @@ class SelectionTests(unittest.TestCase):
     def test_discovery_works_with_empty_allowlist(self):
         r = self.rank(block(B), candidates='', discover=1)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, B))
+
+    def test_quic_candidate_needs_its_own_protocol_success(self):
+        args='--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=2'
+        log=block(args).replace('curl_test_https_tls13','curl_test_http3')
+        self.assertEqual(self.rank(log,args+'\n').returncode,2)
+        r=self.rank(log,args+'\n',protocol='curl_test_http3')
+        self.assertEqual((r.returncode,r.stdout.strip()),(0,args))
 
     def test_rejects_one_failed_attempt(self):
         self.assertEqual(self.rank(block(A, fail=2)).returncode, 2)
