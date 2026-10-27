@@ -1,0 +1,11 @@
+--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=6
+--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=11
+--blob=yta_quic:@/opt/zapret2/files/fake/quic_initial_www_google_com.bin --payload=quic_initial --lua-desync=fake:blob=yta_quic:repeats=6
+--blob=yta_quic:@/opt/zapret2/files/fake/quic_initial_www_google_com.bin --payload=quic_initial --lua-desync=fake:blob=yta_quic:repeats=11
+--blob=yta_quic:@/opt/zapret2/files/fake/quic_initial_www_google_com.bin --payload=quic_initial --lua-desync=fake:blob=yta_quic:repeats=6:ip_ttl=4
+--blob=yta_quic:@/opt/zapret2/files/fake/quic_initial_www_google_com.bin --payload=quic_initial --lua-desync=fake:blob=yta_quic:repeats=6:ip_ttl=5
+--blob=yta_quic:@/opt/zapret2/files/fake/quic_initial_www_google_com.bin --payload=quic_initial --lua-desync=fake:blob=yta_quic:repeats=6:ip_ttl=6
+--payload=quic_initial --lua-desync=send:ipfrag:ipfrag_pos_udp=8 --lua-desync=drop
+--payload=quic_initial --lua-desync=send:ipfrag:ipfrag_pos_udp=16 --lua-desync=drop
+--payload=quic_initial --lua-desync=send:ipfrag:ipfrag_pos_udp=32 --lua-desync=drop
+--payload=quic_initial --lua-desync=send:ipfrag:ipfrag_pos_udp=64 --lua-desync=drop

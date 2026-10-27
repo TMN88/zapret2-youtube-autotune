@@ -1,0 +1,2 @@
+youtubei.googleapis.com
+youtube.googleapis.com
