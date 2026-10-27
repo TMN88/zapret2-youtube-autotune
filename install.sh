@@ -1,683 +1,549 @@
 #!/bin/sh
-# Own code: MIT. Native Blockcheck2/nfqws2 remain supplied by the user's zapret2 package.
+# MIT. Uses the installed Blockcheck2; does not install/replace zapret2.
 set -eu
-VERSION=1.1.1
-MODE=autotune
-SECTION=main
-WAN_NETWORK=wan
-REPEATS=5
-QUIC=1
-REQUIRE_QUIC=0
-MEDIA_FILE=
-CURL_BIN=
-RUN=
-BACKUP=
-LOCK=/var/lock/zapret2-youtube-autotune.lock
+VERSION=2.0.0
+BASE=/opt/zapret2
 OWN=/etc/zapret2-youtube-autotune
+LOCK=/var/lock/zapret2-youtube-autotune.lock
+WAN_NETWORK=wan
+REPEATS=3
+WANT=3
+TIME_LIMIT=1800
+MODE=autotune
+BACKUP=
+RUN=
+SCAN_PID=
+WATCH_PID=
 CHANGED=0
 SUCCESS=0
-SCAN_PID=
-TAIL_PID=
-CONFLICT=0
-MANAGER_ACTIVE=0
 LOCK_HELD=0
+MEDIA_FILE=
 
 say() { printf '%s\n' "$*"; }
 die() { say "Ошибка: $*" >&2; exit 1; }
 valid_name() { case "$1" in ''|*[!A-Za-z0-9_]*) return 1;; esac; }
-valid_device() { case "$1" in ''|*[!A-Za-z0-9_.:-]*) return 1;; esac; }
+banner() {
+    printf '\033[1;97;41m ОБЯЗАТЕЛЬНАЯ РУЧНАЯ ПОДГОТОВКА ДО ЗАПУСКА \033[0m\n'
+    printf '\033[1;93m%s\033[0m\n' \
+      '1. zapret2 уже установлен; его служба ОСТАНОВЛЕНА.' \
+      '2. YouTube отключён/исключён в podcop / forcop / forkozz / steer (Podkop / Forkop).' \
+      '3. Другие обходы YouTube, VPN-перехват и FakeIP для YouTube отключены.' \
+      'Скрипт не выполняет эту подготовку за вас. Проверяется только YouTube.'
+}
 help() {
     cat <<'HELP'
-YouTube-only zapret2 installer/autotuner for OpenWrt 24.10 (opkg, aarch64_cortex-a53).
-Usage: sh install.sh [--preset | --check | --rollback BACKUP] [options]
-Default: native Blockcheck2 selection and installation, five sequential repeats.
-  --preset               Test/apply the TCP pair from the successful pilot; not a per-ISP search.
-  --check                Read-only prerequisites/status; no downloads, backups or changes.
-  --clean-temp           Remove curl downloads from inactive previous runs only; no router configuration changes.
-  --section NAME         Podkop VPN section (default main); other sections are preserved.
-  --wan-network NAME     OpenWrt WAN network (default wan).
-  --curl PATH            Existing curl with HTTP3 (otherwise download verified curl into RAM).
-  --no-quic              Explicitly skip QUIC; report it as untested.
-  --require-quic         Roll back unless QUIC also passes selection/verification.
-  --media-url-file FILE  Optional valid YouTube googlevideo media URL, one line, from this WAN.
-  --rollback BACKUP      Run the root-only rollback saved by this installer.
+YouTube Autotune 2: OpenWrt 24/25, installed native Blockcheck2.
+sh install.sh [--want 2|3] [--base /opt/zapret2] [--wan-network wan]
+  --scan-seconds N        Discovery time limit per pass (default 1800).
+  --media-url-file FILE   Optional fresh HTTPS googlevideo media URL from this WAN.
+  --check                Read-only prerequisites, no network tests.
+  --rollback BACKUP      Restore the original stopped service and configuration.
   --help | --version
-Requires Podkop and Routerich zapret2 (or already installed Zapret Manager to install it).
-Never installs firmware or changes Tailscale. Backs up/replaces existing zapret2 strategies.
+Default: find and independently verify 2–3 IPv4 TCP/TLS alternatives, enable one.
+TLS 1.2 + 1.3; no HTTP3 download, QUIC claim, Podkop changes or package installation.
+Supports Routerich/Manager UCI and official shell configuration; unknown layouts fail closed.
 HELP
-}
-
-# Domain lists are expanded explicitly; all unrelated selections are retained.
-expanded_lists() {
-    out=
-    for item in "$@"; do
-        case "$item" in
-            russia_inside) items='geoblock block porn news anime hdrezka tiktok meta twitter discord';;
-            youtube) continue;;
-            *) items=$item;;
-        esac
-        for x in $items; do case " $out " in *" $x "*) ;; *) out="${out:+$out }$x";; esac; done
-    done
-    printf '%s\n' "$out"
-}
-
-audit() {
-    say "YouTube autotune $VERSION"
-    [ -f /etc/openwrt_release ] || die 'Это не OpenWrt.'
-    . /etc/openwrt_release
-    say "OpenWrt: $DISTRIB_RELEASE / $DISTRIB_ARCH"
-    command -v uci >/dev/null || die 'Нет uci.'
-    say "Podkop: $(uci -q get "podkop.$SECTION.connection_type" || true)"
-    say "Списки: $(uci -q get "podkop.$SECTION.community_lists" || true)"
-    say "VPN: $(uci -q get "podkop.$SECTION.interface" || true)"
-    if [ -x /opt/zapret2/blockcheck2.sh ]; then say 'Blockcheck2: установлен'; else say 'Blockcheck2: отсутствует'; fi
-    if command -v curl >/dev/null; then curl --version | head -n 4; fi
-    if [ -x /etc/init.d/zapret2 ]; then /etc/init.d/zapret2 status || true; fi
 }
 
 preflight() {
     [ "$(id -u)" = 0 ] || die 'Запустите от root.'
     [ -f /etc/openwrt_release ] || die 'Это не OpenWrt.'
     . /etc/openwrt_release
-    [ "$DISTRIB_ARCH" = aarch64_cortex-a53 ] || die 'Эта упаковка manager/zapret2 поддерживает aarch64_cortex-a53, не MIPS.'
-    case "$DISTRIB_RELEASE" in 24.10*) ;; *) die 'В этой версии поддержан OpenWrt 24.10 с opkg.';; esac
-    for cmd in uci jq curl sha256sum awk ip ubus opkg jsonfilter sing-box nft; do command -v "$cmd" >/dev/null || die "Нет $cmd"; done
-    [ -x /usr/bin/podkop ] || die 'Нужен Podkop; Forkop не заменяется.'
-    [ "$(uci -q get "podkop.$SECTION")" = section ] || die 'Неизвестная секция Podkop.'
-    [ "$(uci -q get "podkop.$SECTION.connection_type")" = vpn ] || die 'Нужна VPN-секция Podkop.'
-    [ "$(uci -q get podkop.settings.enable_output_network_interface || echo 0)" != 1 ] || die 'Для честного WAN-теста нужен выключенный перехват OUTPUT в Podkop. Настройка не менялась.'
-    [ -z "$(uci changes podkop)" ] && [ -z "$(uci changes zapret2)" ] || die 'Есть несохранённые изменения LuCI/UCI. Сначала завершите их.'
-    [ ! -x /etc/init.d/zapret ] || die 'Обнаружен старый Zapret. Он не удаляется автоматически.'
-    if [ -f /tmp/zapret-manager-luci/install_zapret2.pid ] && ! grep -q '^__DONE__ ' /tmp/zapret-manager-luci/install_zapret2.log 2>/dev/null; then
-        manager_pid=$(cat /tmp/zapret-manager-luci/install_zapret2.pid)
-        case "$manager_pid" in ''|*[!0-9]*) ;; *) kill -0 "$manager_pid" 2>/dev/null && die 'Установка manager ещё выполняется.';; esac
+    case "$DISTRIB_RELEASE" in 24.*|25.*) ;; *) die 'Поддерживаются OpenWrt 24/25.';; esac
+    for cmd in uci curl awk sed sort cmp sha256sum setsid nft ubus jsonfilter tar; do
+        command -v "$cmd" >/dev/null || die "Нет $cmd. Установите недостающую зависимость вручную (opkg на 24 / apk на 25)."
+    done
+    case "$BASE" in /*) ;; *) die 'Нужен абсолютный --base.';; esac
+    case "$BASE" in *[!A-Za-z0-9_./-]*) die 'Недопустимый --base.';; esac
+    BASE=$(readlink -f "$BASE")
+    [ -x "$BASE/blockcheck2.sh" ] && [ -x "$BASE/nfq2/nfqws2" ] || die 'Установите zapret2 и Blockcheck2 вручную.'
+    [ -d "$BASE/blockcheck2.d/standard" ] && [ -f "$BASE/blockcheck2.d/custom/10-list.sh" ] || die 'Нет native standard/custom тестов Blockcheck2.'
+    [ -x /etc/init.d/zapret2 ] || die 'Нет службы /etc/init.d/zapret2.'
+    # procd status alone is insufficient on some packages.
+    if /etc/init.d/zapret2 running >/dev/null 2>&1 || pidof nfqws2 >/dev/null 2>&1; then
+        die 'Сначала вручную остановите zapret2 / nfqws2.'
     fi
-    if [ -x /etc/init.d/zapret2 ]; then
-        [ -f /opt/zapret2/init.d/openwrt/uci2config ] || die 'Нужна UCI-сборка zapret2 из manager/Routerich.'
-        say 'Прежние стратегии и custom.d будут сохранены в backup и отключены перед тестами.'
+    [ -z "$(uci changes zapret2)" ] || die 'Завершите несохранённые изменения zapret2 в LuCI/UCI.'
+    if [ -f "$BASE/init.d/openwrt/uci2config" ]; then
+        LAYOUT=uci
+        [ "$(uci -q get zapret2.main)" = zapret2 ] || die 'Неизвестная UCI-схема: нет zapret2.main.'
+        CONFIG=/etc/config/zapret2
     else
-        [ -x /opt/zapret-manager-luci/backend.sh ] || die 'Установите Zapret Manager или его UCI-пакет zapret2.'
+        LAYOUT=shell
+        CONFIG="$BASE/config"
+        [ -f "$CONFIG" ] && grep -q '^NFQWS2_OPT=' "$CONFIG" || die 'Неизвестная конфигурация zapret2.'
     fi
-    VPN_NETWORK=$(uci -q get "podkop.$SECTION.interface")
-    valid_device "$VPN_NETWORK" || die 'Недопустимое имя VPN.'
-    VPN_DEV=$(ubus call "network.interface.$VPN_NETWORK" status | jsonfilter -e '@.l3_device')
     WAN_DEV=$(ubus call "network.interface.$WAN_NETWORK" status | jsonfilter -e '@.l3_device')
-    valid_device "$VPN_DEV" && valid_device "$WAN_DEV" || die 'Не удалось определить VPN/WAN device.'
-    [ "$WAN_DEV" != "$VPN_DEV" ] || die 'WAN совпал с VPN.'
+    case "$WAN_DEV" in ''|*[!A-Za-z0-9_.:-]*) die 'Не удалось определить WAN device.';; esac
     if [ -e "$OWN" ]; then
-        [ -f "$OWN/owner" ] && [ "$(cat "$OWN/owner")" = zapret2-youtube-autotune ] || die "Папка $OWN уже используется другим владельцем."
+        [ -f "$OWN/owner" ] && [ "$(cat "$OWN/owner")" = zapret2-youtube-autotune ] || die "Папка $OWN принадлежит другой программе."
     fi
+    if [ "$LAYOUT" = uci ]; then guard_reserved_sections; fi
+    say "YouTube Autotune $VERSION: OpenWrt $DISTRIB_RELEASE, $LAYOUT, WAN $WAN_DEV."
+}
+
+guard_reserved_sections() {
+    for key in yta_1 yta_2 yta_3 yta_hosts; do
+        if uci -q get "zapret2.$key" >/dev/null && [ ! -f "$OWN/owner" ]; then die "UCI $key уже существует."; fi
+    done
 }
 
 backup() {
-    mkdir "$LOCK" 2>/dev/null || die "Уже есть запуск/lock: $LOCK. Не запускайте два подбора одновременно."
+    mkdir -p /var/lock
+    mkdir "$LOCK" 2>/dev/null || die "Есть активный/незавершённый запуск: $LOCK. Проверьте его backup перед повторным запуском."
     LOCK_HELD=1
-    printf '%s\n' "$$" > "$LOCK/pid"
     umask 077
+    printf '%s\n' "$$" > "$LOCK/pid"
     BACKUP="/root/zapret2-youtube-backup-$(date +%Y%m%d-%H%M%S)-$$"
     RUN="/tmp/zapret2-youtube-autotune-$$"
     mkdir "$BACKUP" "$RUN"
-    cp -p /etc/config/podkop "$BACKUP/podkop"
-    cp -p /etc/config/dhcp "$BACKUP/dhcp"
-    printf '0\n' > "$BACKUP/was-installed"
-    printf '0\n' > "$BACKUP/was-running"
+    printf '%s\n' "$BACKUP" > "$LOCK/backup"
+    printf '%s\n' "$CONFIG" > "$BACKUP/config-path"
+    printf '%s\n' "$BASE" > "$BACKUP/base-path"
+    printf '%s\n' "$LAYOUT" > "$BACKUP/layout"
+    cp -p "$CONFIG" "$BACKUP/original-config"
+    # UCI services may regenerate BASE/config; preserve it separately, too.
+    if [ -f "$BASE/config" ]; then cp -p "$BASE/config" "$BACKUP/base-config"; fi
     printf '0\n' > "$BACKUP/was-enabled"
-    if [ -x /etc/init.d/zapret2 ]; then
-        printf '1\n' > "$BACKUP/was-installed"
-        cp -p /etc/config/zapret2 "$BACKUP/zapret2"
-        /etc/init.d/zapret2 status >/dev/null 2>&1 && printf '1\n' > "$BACKUP/was-running" || true
-        /etc/init.d/zapret2 enabled >/dev/null 2>&1 && printf '1\n' > "$BACKUP/was-enabled" || true
-    fi
-    [ ! -d "$OWN" ] || tar -czf "$BACKUP/owned-hostlists.tar.gz" -C /etc zapret2-youtube-autotune
-    # Files are not removed; archive custom hooks as well as their UCI enable flag.
-    if [ -d /opt/zapret2/init.d/custom.d ]; then
-        tar -czf "$BACKUP/custom.d.tar.gz" -C /opt/zapret2/init.d custom.d
-    fi
-    sha256sum /etc/config/network /etc/config/firewall > "$BACKUP/recovery.sha256"
-    sha256sum /etc/config/podkop > "$BACKUP/podkop.before.sha256"
-    opkg list-installed > "$BACKUP/packages.before"
+    /etc/init.d/zapret2 enabled >/dev/null 2>&1 && printf '1\n' > "$BACKUP/was-enabled" || true
+    [ ! -d "$OWN" ] || tar -czf "$BACKUP/owned.tar.gz" -C /etc zapret2-youtube-autotune
+    sha256sum "$CONFIG" > "$BACKUP/config.sha256"
     cat > "$BACKUP/rollback.sh" <<'ROLLBACK'
 #!/bin/sh
 set -eu
 b=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 [ "$(id -u)" = 0 ] || exit 1
-test -f "$b/podkop"
+c=$(cat "$b/config-path"); base=$(cat "$b/base-path")
 /etc/init.d/zapret2 stop >/dev/null 2>&1 || true
-uci -q revert podkop || true
-uci -q revert zapret2 || true
-if [ -f "$b/podkop-touched" ]; then
-    cp -p "$b/podkop" /etc/config/podkop
-    cp -p "$b/dhcp" /etc/config/dhcp
-fi
-if [ "$(cat "$b/was-installed")" = 1 ]; then
-    cp -p "$b/zapret2" /etc/config/zapret2
+if [ "$(cat "$b/layout")" = uci ]; then uci -q revert zapret2 || true; fi
+cp -p "$b/original-config" "$c"
+if [ -f "$b/base-config" ]; then cp -p "$b/base-config" "$base/config"; fi
+rm -f /etc/zapret2-youtube-autotune/youtube.txt /etc/zapret2-youtube-autotune/owner
+for n in 1 2 3; do rm -f "/etc/zapret2-youtube-autotune/strategy-$n.txt"; done
+if [ -f "$b/owned.tar.gz" ]; then
+    tar -xzf "$b/owned.tar.gz" -C /etc
 else
-    uci -q set zapret2.main.enabled=0 || true
-    uci -q commit zapret2 || true
+    # Only our fixed files; never recursive deletion of user-supplied paths.
+    rm -f /etc/zapret2-youtube-autotune/youtube.txt /etc/zapret2-youtube-autotune/owner
+    for n in 1 2 3; do rm -f "/etc/zapret2-youtube-autotune/strategy-$n.txt"; done
+    rmdir /etc/zapret2-youtube-autotune 2>/dev/null || true
 fi
-[ ! -f "$b/owned-hostlists.tar.gz" ] || tar -xzf "$b/owned-hostlists.tar.gz" -C /etc
-if [ -f "$b/podkop-touched" ]; then /usr/bin/podkop reload > "$b/rollback.log" 2>&1; fi
-if [ -x /etc/init.d/zapret2 ]; then
-    if [ "$(cat "$b/was-enabled")" = 1 ]; then /etc/init.d/zapret2 enable; else /etc/init.d/zapret2 disable; fi
-    if [ "$(cat "$b/was-running")" = 1 ]; then /etc/init.d/zapret2 start >> "$b/rollback.log" 2>&1; fi
-fi
-sha256sum -c "$b/recovery.sha256"
-printf 'Исходные Podkop/YouTube и состояние zapret2 восстановлены. Добавленные пакеты сохранены.\n'
+if [ "$(cat "$b/was-enabled")" = 1 ]; then /etc/init.d/zapret2 enable; else /etc/init.d/zapret2 disable; fi
+printf 'Исходная конфигурация восстановлена; zapret2 остановлен, как перед подбором.\n'
 ROLLBACK
     chmod 700 "$BACKUP/rollback.sh"
-    say "Резервная копия: $BACKUP"
-    say "Возврат: sh $BACKUP/rollback.sh"
+    # Survives a killed parent. Never restores over a detected concurrent edit.
+    cat > "$BACKUP/watchdog.sh" <<'WATCHDOG'
+#!/bin/sh
+b=$1; parent=$2
+while kill -0 "$parent" 2>/dev/null; do
+    [ ! -f "$b/finished" ] || exit 0
+    sleep 5
+done
+if [ -f "$b/scan-pid" ]; then
+    p=$(cat "$b/scan-pid")
+    kill -s TERM -- "-$p" 2>/dev/null || true
+    sleep 2
+    kill -s KILL -- "-$p" 2>/dev/null || true
+    nft delete table inet "blockcheck2-$p" 2>/dev/null || true
+fi
+if [ -f "$b/changed" ] && [ ! -f "$b/conflict" ] && [ ! -f "$b/finished" ]; then
+    sh "$b/rollback.sh" > "$b/watchdog.log" 2>&1 || exit 1
+fi
+if [ "$(cat /var/lock/zapret2-youtube-autotune.lock/pid 2>/dev/null)" = "$parent" ]; then
+    rm -f /var/lock/zapret2-youtube-autotune.lock/pid /var/lock/zapret2-youtube-autotune.lock/backup
+    rmdir /var/lock/zapret2-youtube-autotune.lock 2>/dev/null || true
+fi
+WATCHDOG
+    setsid sh "$BACKUP/watchdog.sh" "$BACKUP" "$$" </dev/null > "$BACKUP/watchdog.log" 2>&1 &
+    WATCH_PID=$!
+    say "Backup и логи: $BACKUP"
+    say "Ручной откат: sh $BACKUP/rollback.sh"
 }
 
+stop_scan() {
+    [ -n "$SCAN_PID" ] || return 0
+    kill -s TERM -- "-$SCAN_PID" 2>/dev/null || true
+    n=0
+    while kill -0 "$SCAN_PID" 2>/dev/null && [ "$n" -lt 5 ]; do sleep 1; n=$((n+1)); done
+    kill -s KILL -- "-$SCAN_PID" 2>/dev/null || true
+    wait "$SCAN_PID" 2>/dev/null || true
+    # Only this invocation's table; no global blockcheck/nfqws sweep.
+    nft delete table inet "blockcheck2-$SCAN_PID" 2>/dev/null || true
+    SCAN_PID=
+    rm -f "$BACKUP/scan-pid"
+}
 cleanup() {
     rc=$?
     trap - EXIT HUP INT TERM
-    if [ -n "$SCAN_PID" ]; then kill -TERM "$SCAN_PID" 2>/dev/null || true; wait "$SCAN_PID" 2>/dev/null || true; fi
-    [ -z "$TAIL_PID" ] || kill "$TAIL_PID" 2>/dev/null || true
-    # Release tmpfs RAM before attempting rollback/service restarts.
-    if [ -n "$RUN" ]; then remove_run_downloads "$RUN"; fi
-    if [ "$MANAGER_ACTIVE" = 1 ]; then
-        say 'Ожидание завершения пакетной операции manager перед возвратом (opkg принудительно не прерывается).' >&2
-        manager_done=0
-        for n in $(seq 1 180); do
-            if grep -q '^__DONE__ ' /tmp/zapret-manager-luci/install_zapret2.log 2>/dev/null; then manager_done=1; break; fi
-            sleep 2
-        done
-        if [ "$manager_done" != 1 ]; then
-            # Only the disabled seed was written; Podkop preparation has not started yet.
-            CHANGED=0
-            say 'Manager ещё не завершился. Podkop не менялся; начальная конфигурация zapret2 оставлена выключенной. Проверьте журнал manager.' >&2
+    stop_scan
+    if [ "$SUCCESS" != 1 ] && [ "$CHANGED" = 1 ]; then
+        if [ -f "$BACKUP/conflict" ]; then
+            say "Параллельные изменения: автоматическая перезапись остановлена. Backup: $BACKUP" >&2
+        elif ! sh "$BACKUP/rollback.sh"; then
+            say "Автовозврат не завершён: sh $BACKUP/rollback.sh" >&2
+            exit 1
         fi
     fi
-    if [ "$CONFLICT" = 1 ]; then
-        say "Обнаружены параллельные изменения UCI: они не перезаписываются. Проверьте состояние вручную. Backup: $BACKUP" >&2
-    elif [ "$SUCCESS" != 1 ] && [ "$CHANGED" = 1 ]; then
-        say 'Подбор/применение не завершились: возвращаю исходную конфигурацию.' >&2
-        if ! sh "$BACKUP/rollback.sh"; then say "Автовозврат не завершился; выполните sh $BACKUP/rollback.sh" >&2; fi
-    fi
-    if [ "$LOCK_HELD" = 1 ]; then rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true; fi
+    [ ! -d "$BACKUP" ] || : > "$BACKUP/finished"
+    [ -z "$WATCH_PID" ] || kill "$WATCH_PID" 2>/dev/null || true
+    if [ "$LOCK_HELD" = 1 ]; then rm -f "$LOCK/pid" "$LOCK/backup"; rmdir "$LOCK" 2>/dev/null || true; fi
     exit "$rc"
 }
 
-remove_run_downloads() {
-    case "$1" in /tmp/zapret2-youtube-autotune-*) ;;
-        *) return 1;;
-    esac
-    suffix=${1#/tmp/zapret2-youtube-autotune-}
-    case "$suffix" in ''|*[!0-9]*) return 1;; esac
-    [ -d "$1" ] && [ ! -L "$1" ] || return 0
-    # No recursive removal, glob deletion, or removal of caller-supplied --curl.
-    rm -f "$1/curl.tar.xz" "$1/curl.tar" "$1/curl-http3" "$1/media.curl"
-}
-
-clean_stale_downloads() {
-    for old_run in /tmp/zapret2-youtube-autotune-*; do
-        suffix=${old_run#/tmp/zapret2-youtube-autotune-}
-        case "$suffix" in ''|*[!0-9]*) continue;; esac
-        [ "$suffix" != "$$" ] || continue
-        kill -0 "$suffix" 2>/dev/null && continue
-        remove_run_downloads "$old_run"
-    done
-}
-
-check_memory() {
-    # df /tmp is tmpfs capacity, not available physical memory.
-    required_kb=40000
-    if [ "$QUIC" = 1 ] && [ -z "$CURL_BIN" ] && ! curl --version | grep -q ' HTTP3'; then required_kb=80000; fi
-    available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
-    case "$available_kb" in ''|*[!0-9]*) die 'Не удалось определить MemAvailable.';; esac
-    say "RAM MemAvailable: $available_kb kB; минимум для этого запуска: $required_kb kB."
-    [ "$available_kb" -ge "$required_kb" ] || die 'Недостаточно доступной RAM. Подбор не запускается; освободите память или используйте --no-quic. Tailscale не останавливается.'
-}
-
-fetch() {
-    # Public downloads/DoH only use the selected VPN; measurements never do.
-    curl --interface "$VPN_DEV" --noproxy '*' -fsSL --retry 1 --connect-timeout 10 --max-time 120 "$1" -o "$2"
-}
-
-ensure_zapret2() {
-    [ ! -x /etc/init.d/zapret2 ] || return 0
-    CHANGED=1
-    cat > /etc/config/zapret2 <<'SEED'
-#nochange
-config zapret2 'main'
-    option enabled '0'
-    option custom_scripts '0'
-    option nfqws_ports_tcp '443'
-    option nfqws_ports_udp '443'
-    option flowoffload 'donttouch'
-SEED
-    /opt/zapret-manager-luci/backend.sh zapret2_action install > "$BACKUP/manager-start.log"
-    [ "$(jq -r '.started // false' "$BACKUP/manager-start.log")" = true ] || die 'Manager не начал установку.'
-    MANAGER_ACTIVE=1
-    say 'Установка zapret2 через установленный manager…'
-    done_install=0
-    for n in $(seq 1 180); do
-        log=/tmp/zapret-manager-luci/install_zapret2.log
-        if [ -f "$log" ] && grep -q '^__DONE__ ' "$log"; then
-            grep -q '^__DONE__ 0' "$log" || die 'Manager сообщил ошибку установки.'
-            done_install=1; MANAGER_ACTIVE=0; break
-        fi
-        sleep 2
-    done
-    [ "$done_install" = 1 ] || die 'Не дождались установки manager; проверьте его журнал.'
-    cp "$log" "$BACKUP/manager-install.log"
-    [ -x /opt/zapret2/blockcheck2.sh ] || die 'После установки нет Blockcheck2.'
-    [ -f /opt/zapret2/init.d/openwrt/uci2config ] || die 'Нет UCI-преобразователя zapret2.'
-    [ "$(uci -q get zapret2.main.enabled)" = 0 ] || die 'Manager не сохранил безопасное выключенное начальное состояние.'
-}
-
-ensure_curl() {
-    if [ -z "$CURL_BIN" ] && curl --version | grep -q ' HTTP3'; then CURL_BIN=$(command -v curl); fi
-    if [ -n "$CURL_BIN" ]; then
-        [ -x "$CURL_BIN" ] || die 'Указанный curl не исполняемый.'
-        "$CURL_BIN" --version | grep -q ' HTTP3' || die 'Указанный curl не имеет HTTP3.'
-    elif [ "$QUIC" = 1 ]; then
-        free_kb=$(df -k /tmp | awk 'NR==2 {print $4}')
-        [ "$free_kb" -ge 35000 ] || die 'Для HTTP3 нужно не менее 35 МБ свободного /tmp.'
-        if ! command -v xz >/dev/null; then
-            say 'Установка signed-feed зависимости xz для распаковки curl.'
-            opkg update > "$BACKUP/opkg-update.log" 2>&1
-            opkg install xz > "$BACKUP/opkg-xz.log" 2>&1
-        fi
-        command -v xz >/dev/null 2>&1 || die 'После установки пакета xz команда xz недоступна; проверьте opkg-xz.log в резервной копии.'
-        fetch 'https://github.com/stunnel/static-curl/releases/download/8.23.0-1/curl-linux-aarch64-musl-8.23.0-1.tar.xz' "$RUN/curl.tar.xz"
-        printf '%s  %s\n' e20f26e5b87c1883608f286f86bdabf39d3b8556e8a8e75dfe205e14bd206199 "$RUN/curl.tar.xz" | sha256sum -c -
-        xz -dc "$RUN/curl.tar.xz" > "$RUN/curl.tar"
-        tar -xOf "$RUN/curl.tar" curl > "$RUN/curl-http3"
-        rm -f "$RUN/curl.tar.xz" "$RUN/curl.tar"
-        chmod 700 "$RUN/curl-http3"
-        CURL_BIN="$RUN/curl-http3"
-        "$CURL_BIN" --version | grep -q ' HTTP3' || die 'Загруженный curl не имеет HTTP3.'
-    else CURL_BIN=$(command -v curl)
+assert_unchanged() {
+    if ! sha256sum -c "$BACKUP/config.sha256" >/dev/null || { [ "$LAYOUT" = uci ] && [ -n "$(uci changes zapret2)" ]; }; then
+        : > "$BACKUP/conflict"
+        die 'Конфигурация изменена другим процессом; остановка без её перезаписи.'
     fi
-    case "$CURL_BIN" in *[!A-Za-z0-9_./-]*) die 'Путь curl должен быть без пробелов и специальных символов.';; esac
-    export YTA_CURL="$CURL_BIN" YTA_WAN="$WAN_DEV" YTA_VPN="$VPN_DEV"
+}
+
+prepare_blockcheck() {
+    # Private test tree; upstream code and binary versions remain matched.
+    mkdir -p "$RUN/bc/blockcheck2.d/discover" "$RUN/bc/blockcheck2.d/verify"
+    for d in common lua nfq2 mdig binaries; do
+        [ ! -d "$BASE/$d" ] || ln -s "$BASE/$d" "$RUN/bc/$d"
+    done
+    cp "$BASE/blockcheck2.sh" "$RUN/bc/blockcheck2.sh"
+    cp "$BASE/blockcheck2.d/standard/"* "$RUN/bc/blockcheck2.d/discover/"
+    cp "$BASE/blockcheck2.d/custom/10-list.sh" "$RUN/bc/blockcheck2.d/verify/"
+    : > "$RUN/bc/config"
+    # Hook uses public pktws test API rather than rewriting the installed engine.
+    # Name sorts before native scripts, so it is sourced before any trials.
+    cat > "$RUN/bc/blockcheck2.d/discover/00-yta.sh" <<'HOOK'
+pktws_curl_test_update()
+{
+    local yta_code
+    pktws_curl_test "$@"; yta_code=$?
+    if [ "$yta_code" = 0 ]; then
+        shift; shift
+        strategy="${strategy:-$*}"
+        # Only successes are counted; the outer parser also checks all attempts.
+        YTA_OK=$((${YTA_OK:-0}+1))
+        if [ "$YTA_OK" -ge 8 ]; then unprepare_all; exit 0; fi
+    fi
+    return "$yta_code"
+}
+HOOK
+    export YTA_CURL="$(command -v curl)" YTA_WAN="$WAN_DEV"
     cat > "$RUN/curl-wrapper" <<'WRAPPER'
 #!/bin/sh
-case " $* " in
-    *'https://dns.google/dns-query'*) exec "$YTA_CURL" --interface "$YTA_VPN" --noproxy '*' "$@" ;;
-    *) exec "$YTA_CURL" --interface "$YTA_WAN" --noproxy '*' "$@" ;;
-esac
+exec "$YTA_CURL" --interface "$YTA_WAN" --noproxy '*' "$@"
 WRAPPER
     chmod 700 "$RUN/curl-wrapper"
-}
-
-clear_zapret_strategies() {
-    # Re-query after each deletion: anonymous UCI section indices shift.
-    while :; do
-        old=$(uci show zapret2 | sed -n 's/^zapret2\.\([^=]*\)=strategy$/\1/p' | head -n 1)
-        [ -n "$old" ] || break
-        uci delete "zapret2.$old"
-    done
-    uci set zapret2.main.enabled=0
-    uci set zapret2.main.custom_scripts=0
-}
-
-prepare_community_lists() {
-    # A second section with Russia Inside would still capture YouTube/FakeIP.
-    for pod_section in $(uci show podkop | sed -n 's/^podkop\.\([^=]*\)=section$/\1/p'); do
-        lists=$(uci -q get "podkop.$pod_section.community_lists" || true)
-        case " $lists " in
-            *' russia_inside '*|*' youtube '*) ;;
-            *) continue;;
-        esac
-        new=$(expanded_lists $lists)
-        uci -q delete "podkop.$pod_section.community_lists" || true
-        for item in $new; do uci add_list "podkop.$pod_section.community_lists=$item"; done
-        say "Podkop $pod_section: Russia Inside/YouTube заменены; списки: ${new:-нет}."
-    done
-}
-
-prepare_podkop() {
-    CHANGED=1
-    : > "$BACKUP/podkop-touched"
-    /etc/init.d/zapret2 stop > "$BACKUP/stop-zapret2.log" 2>&1
-    pidof nfqws2 >/dev/null && die 'Остался посторонний nfqws2: измерения смешались бы.'
-    clear_zapret_strategies
-    say 'Прежние стратегии убраны из активной UCI-конфигурации; custom.d выключены, файлы сохранены.'
-    prepare_community_lists
-    # Staged UCI changes: a power loss before final commit leaves the original Podkop file.
-    /usr/bin/podkop reload > "$BACKUP/prepare-podkop.log" 2>&1
-    # Supported Podkop reload must not have committed the staged routing configuration.
-    sha256sum -c "$BACKUP/podkop.before.sha256" >/dev/null || die 'Podkop неожиданно сохранил конфигурацию при reload; выполняется возврат.'
-    uci changes podkop > "$BACKUP/planned-podkop.changes"
-    sing-box check -c /etc/sing-box/config.json
-    nft list table inet PodkopTable >/dev/null
-    for host in www.youtube.com i.ytimg.com youtubei.googleapis.com; do
-        dns_ready=0
-        for attempt in 1 2 3 4 5; do
-            ips=$(printf '%s\n' "$host" | /opt/zapret2/mdig/mdig --family=4) || ips=
-            printf 'DNS %s attempt %s: %s\n' "$host" "$attempt" "${ips:-EMPTY}" >> "$BACKUP/dns-preparation.log"
-            if [ -n "$ips" ] && ! printf '%s\n' "$ips" | grep -Eq '(^|[[:space:]])198\.(18|19)\.'; then
-                dns_ready=1; break
-            fi
-            sleep 2
-        done
-        if [ "$dns_ready" != 1 ]; then
-            logread | tail -n 200 > "$BACKUP/system-preparation.log"
-            if [ -z "$ips" ]; then die "DNS не ответил для $host. Это не доказательство FakeIP. Журналы: $BACKUP/dns-preparation.log и system-preparation.log; выполняется возврат."
-            else die "DNS вернул FakeIP для $host: $ips. Проверьте пользовательские/удалённые списки; выполняется возврат."; fi
-        fi
-    done
-    say 'YouTube исключён из community-списков Podkop; остальные параметры секций сохранены.'
+    printf '%s\n' www.youtube.com i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg youtubei.googleapis.com redirector.googlevideo.com > "$RUN/targets"
 }
 
 scan() {
-    label=$1; targets_file=$2; protocol=$3
-    domains=$(tr '\n' ' ' < "$targets_file")
+    label=$1; test=$2; proto=$3; targets=$4
     log="$BACKUP/$label.log"
-    say "Blockcheck2: $label, $REPEATS повторов. Журнал: $log"
-    (
-        export CURL="$RUN/curl-wrapper" TEST=custom DOMAINS="$domains" BATCH=1 IPVS=4
-        export SCANLEVEL=force PARALLEL=0 REPEATS
-        export LIST_HTTPS_TLS13="$RUN/tcp.txt" LIST_HTTPS_TLS12="$RUN/tcp.txt" LIST_QUIC="$RUN/quic.txt"
-        export ENABLE_HTTP=0 ENABLE_HTTPS_TLS12=0 ENABLE_HTTPS_TLS13=0 ENABLE_HTTP3=0
-        if [ "$protocol" = curl_test_http3 ]; then export ENABLE_HTTP3=1; else export ENABLE_HTTPS_TLS13=1; fi
-        export SECURE_DNS=1 SKIP_DNSCHECK=1 SKIP_IPBLOCK=1 DOH_SERVER=https://dns.google/dns-query
-        export CURL_MAX_TIME=5 CURL_MAX_TIME_QUIC=5 CURL_MAX_TIME_DOH=8 CURL_HTTPS_GET=1 PACE=500
-        exec /opt/zapret2/blockcheck2.sh
-    ) > "$log" 2>&1 &
+    say "Blockcheck2: $label (только YouTube, $REPEATS последовательных попытки)."
+    # Start directly via setsid: recorded PID equals the engine's process group/table ID.
+    env ZAPRET_BASE="$RUN/bc" ZAPRET_RW="$RUN/bc" ZAPRET_CONFIG="$RUN/bc/config" \
+      NFQWS2="$BASE/nfq2/nfqws2" MDIG="$BASE/mdig/mdig" SIMULATE=0 SKIP_PKTWS=0 \
+      CURL="$RUN/curl-wrapper" TEST="$test" DOMAINS="$(cat "$targets")" BATCH=1 IPVS=4 \
+      SCANLEVEL=force PARALLEL=0 REPEATS="$REPEATS" FWTYPE=nftables \
+      LIST_HTTPS_TLS13="$RUN/candidates" LIST_HTTPS_TLS12="$RUN/candidates" \
+      ENABLE_HTTP=0 ENABLE_HTTPS_TLS12="$([ "$proto" = tls12 ] && echo 1 || echo 0)" \
+      ENABLE_HTTPS_TLS13="$([ "$proto" = tls13 ] && echo 1 || echo 0)" ENABLE_HTTP3=0 \
+      SECURE_DNS=1 SKIP_DNSCHECK=1 SKIP_IPBLOCK=1 DOH_SERVER=https://dns.google/dns-query \
+      CURL_MAX_TIME=8 CURL_MAX_TIME_DOH=8 CURL_HTTPS_GET=1 PACE=300 \
+      setsid sh "$RUN/bc/blockcheck2.sh" > "$log" 2>&1 &
     SCAN_PID=$!
-    tail -f "$log" & TAIL_PID=$!
+    printf '%s\n' "$SCAN_PID" > "$BACKUP/scan-pid"
+    seconds=0
+    while kill -0 "$SCAN_PID" 2>/dev/null; do
+        if [ "$seconds" -ge "$TIME_LIMIT" ]; then
+            say "Лимит времени $label; используем только завершённые успешные тесты."
+            stop_scan
+            return 0
+        fi
+        sleep 2; seconds=$((seconds+2))
+    done
     scan_rc=0; wait "$SCAN_PID" || scan_rc=$?
-    SCAN_PID=
-    kill "$TAIL_PID" 2>/dev/null || true; wait "$TAIL_PID" 2>/dev/null || true; TAIL_PID=
-    [ "$scan_rc" = 0 ] || die "Blockcheck2 завершился с кодом $scan_rc."
+    stop_scan
+    [ "$scan_rc" = 0 ] || die "Blockcheck2: код $scan_rc, см. $log"
 }
 
-rank() {
-    candidates=$1; targets_file=$2; log=$3; proto=$4; dest=$5
-    awk -v targets="$targets_file" -v repeats="$REPEATS" -v protocol="$proto" \
-        -f "$RUN/select.awk" "$candidates" "$log" > "$dest"
+select_log() {
+    # One parser for discovered and allowlisted validation candidates.
+    awk -v targets="$2" -v repeats="$REPEATS" -v protocol="$3" -v discover="$4" \
+      -f "$RUN/select.awk" "$RUN/candidates" "$1"
 }
 
 choose() {
-    printf '%s\n' www.youtube.com 'i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg' > "$RUN/main-targets"
-    printf '%s\n' youtubei.googleapis.com > "$RUN/api-targets"
-    if [ "$MODE" = preset ]; then
-        sed -n '1p' "$RUN/tcp.txt" > "$RUN/main-selected"
-        sed -n '2p' "$RUN/tcp.txt" > "$RUN/api-selected"
-        say 'Режим preset: проверенный TCP-профиль пилота, а не новый поиск для провайдера.'
+    printf '%s\n' www.youtube.com > "$RUN/discovery-target"
+    : > "$RUN/candidates"
+    scan discover-tls13 discover tls13 "$RUN/discovery-target"
+    select_log "$BACKUP/discover-tls13.log" "$RUN/discovery-target" curl_test_https_tls13 1 > "$RUN/pool" || true
+    awk '!seen[$0]++' "$RUN/pool" > "$RUN/candidates"
+    : > "$RUN/selected"
+    if [ -s "$RUN/candidates" ]; then verify_candidates primary; fi
+    # Fallback only when the verified pool is short; never re-test old candidates.
+    if [ "$(wc -l < "$RUN/selected")" -lt "$WANT" ]; then
+        cp "$RUN/candidates" "$RUN/tried"
+        scan discover-tls12 discover tls12 "$RUN/discovery-target"
+        select_log "$BACKUP/discover-tls12.log" "$RUN/discovery-target" curl_test_https_tls12 1 > "$RUN/extra" || true
+        awk 'FILENAME==ARGV[1] {seen[$0]=1; next} !seen[$0]++' "$RUN/tried" "$RUN/extra" > "$RUN/candidates"
+        if [ -s "$RUN/candidates" ]; then verify_candidates fallback; fi
+    fi
+    [ "$(wc -l < "$RUN/selected")" -ge 2 ] || die 'Меньше двух независимых стратегий прошли все цели и оба TLS. Конфигурация не менялась.'
+}
+
+verify_candidates() {
+    batch=$1
+    scan "verify-$batch-tls13" verify tls13 "$RUN/targets"
+    select_log "$BACKUP/verify-$batch-tls13.log" "$RUN/targets" curl_test_https_tls13 0 > "$RUN/ok13" || true
+    scan "verify-$batch-tls12" verify tls12 "$RUN/targets"
+    select_log "$BACKUP/verify-$batch-tls12.log" "$RUN/targets" curl_test_https_tls12 0 > "$RUN/ok12" || true
+    awk 'FILENAME==ARGV[1] {ok[$0]=1; next} $0 in ok' "$RUN/ok13" "$RUN/ok12" >> "$RUN/selected"
+}
+
+disable_strategies() {
+    for section in $(uci show zapret2 | sed -n 's/^zapret2\.\([^=]*\)=strategy$/\1/p'); do
+        uci set "zapret2.$section.enabled=0"
+    done
+}
+
+stage_profile() {
+    number=$1; args=$2
+    if [ "$LAYOUT" = uci ]; then
+        disable_strategies
+        uci set zapret2.yta_hosts=list
+        uci set "zapret2.yta_hosts.path=$OWN/youtube.txt"
+        uci set "zapret2.yta_$number=strategy"
+        uci set "zapret2.yta_$number.enabled=1"
+        uci set "zapret2.yta_$number.port=443"
+        uci -q delete "zapret2.yta_$number.protocol" || true
+        uci add_list "zapret2.yta_$number.protocol=tcp"
+        uci -q delete "zapret2.yta_$number.filter_l3" || true
+        uci add_list "zapret2.yta_$number.filter_l3=ipv4"
+        uci -q delete "zapret2.yta_$number.filter_l7" || true
+        uci add_list "zapret2.yta_$number.filter_l7=tls"
+        uci -q delete "zapret2.yta_$number.hostlist" || true
+        uci add_list "zapret2.yta_$number.hostlist=yta_hosts"
+        uci set "zapret2.yta_$number.script=$args"
+        uci set zapret2.main.enabled=1
+        uci set zapret2.main.custom_scripts=0
+        uci set zapret2.main.nfqws_ports_tcp=443
+        uci set zapret2.main.nfqws_ports_udp=
+        uci set "zapret2.main.openwrt_wan4=$WAN_NETWORK"
+        uci set zapret2.main.flowoffload=donttouch
+        uci set zapret2.main.disable_ipv6=1
+        uci changes zapret2 > "$BACKUP/planned.changes"
     else
-        scan tcp-main "$RUN/main-targets" curl_test_https_tls13
-        rank "$RUN/tcp.txt" "$RUN/main-targets" "$BACKUP/tcp-main.log" curl_test_https_tls13 "$RUN/main-selected" || die 'Нет общего TCP-кандидата для страницы и превью.'
-        scan tcp-api "$RUN/api-targets" curl_test_https_tls13
-        rank "$RUN/tcp.txt" "$RUN/api-targets" "$BACKUP/tcp-api.log" curl_test_https_tls13 "$RUN/api-selected" || die 'Нет TCP-кандидата для API.'
-    fi
-    if [ "$QUIC" = 1 ]; then
-        scan quic "$RUN/main-targets" curl_test_http3
-        if rank "$RUN/quic.txt" "$RUN/main-targets" "$BACKUP/quic.log" curl_test_http3 "$RUN/quic-selected"; then
-            QUIC_STATUS=selected
-        else QUIC_STATUS=not_found; rm -f "$RUN/quic-selected"; fi
-    else QUIC_STATUS=not_tested
-    fi
-    [ "$REQUIRE_QUIC" = 0 ] || [ "$QUIC_STATUS" = selected ] || die 'QUIC обязателен, но рабочего варианта нет.'
-}
+        cp -p "$BACKUP/original-config" "$RUN/config.new"
+        # Appended assignments override older multiline assignments without corrupting them.
+        cat >> "$RUN/config.new" <<EOF
 
-add_profile() {
-    group=$1; protocol=$2; args_file=$3; hosts=$4; allow=$5
-    args=$(cat "$args_file")
-    grep -Fxq -- "$args" "$allow" || die 'Выбранные параметры отсутствуют в доверенном наборе.'
-    if [ "$protocol" = tcp ]; then l7=tls; else l7=quic; fi
-    # Word splitting creates argv from the allowlist. Never eval parser/log content.
-    /opt/zapret2/nfq2/nfqws2 --dry-run --qnum=300 \
-      --lua-init=@/opt/zapret2/lua/zapret-lib.lua --lua-init=@/opt/zapret2/lua/zapret-antidpi.lua \
-      "--filter-$protocol=443" "--filter-l7=$l7" "--hostlist=$hosts" $args > "$BACKUP/dry-run-$group.log" 2>&1
-    uci -q delete "zapret2.yta_$group" || true
-    uci -q delete "zapret2.yta_${group}_hosts" || true
-    uci set "zapret2.yta_${group}_hosts=list"
-    uci set "zapret2.yta_${group}_hosts.path=$hosts"
-    uci set "zapret2.yta_$group=strategy"
-    uci set "zapret2.yta_$group.enabled=1"
-    uci set "zapret2.yta_$group.port=443"
-    uci add_list "zapret2.yta_$group.protocol=$protocol"
-    uci add_list "zapret2.yta_$group.filter_l3=ipv4"
-    uci add_list "zapret2.yta_$group.filter_l7=$l7"
-    uci add_list "zapret2.yta_$group.hostlist=yta_${group}_hosts"
-    uci set "zapret2.yta_$group.script=$args"
-}
-
-apply_profiles() {
-    mkdir -p "$OWN"; chmod 755 "$OWN"
-    cp "$RUN/main-hosts.txt" "$OWN/main.txt"
-    cp "$RUN/api-hosts.txt" "$OWN/api.txt"
-    chmod 644 "$OWN/main.txt" "$OWN/api.txt"
-    printf 'zapret2-youtube-autotune\n' > "$OWN/owner"
-    add_profile main tcp "$RUN/main-selected" "$OWN/main.txt" "$RUN/tcp.txt"
-    add_profile api tcp "$RUN/api-selected" "$OWN/api.txt" "$RUN/tcp.txt"
-    uci -q delete zapret2.yta_quic || true
-    uci -q delete zapret2.yta_quic_hosts || true
-    if [ -s "$RUN/quic-selected" ]; then add_profile quic udp "$RUN/quic-selected" "$OWN/main.txt" "$RUN/quic.txt"; fi
-    uci set zapret2.main.enabled=1
-    uci set zapret2.main.custom_scripts=0
-    uci set "zapret2.main.openwrt_wan4=$WAN_NETWORK"
-    uci set zapret2.main.openwrt_lan=lan
-    uci set zapret2.main.flowoffload=donttouch
-    /etc/init.d/zapret2 start > "$BACKUP/start.log" 2>&1
-    ready=0
-    for n in 1 2 3 4 5; do if pidof nfqws2 >/dev/null; then ready=1; break; fi; sleep 1; done
-    [ "$ready" = 1 ] || die 'Не запустился nfqws2.'
-    nft list table inet zapret2 > "$BACKUP/nft.after"
-    uci changes zapret2 > "$BACKUP/planned-zapret2.changes"
-    sha256sum /etc/config/zapret2 > "$BACKUP/zapret2.disk.sha256"
+# YouTube Autotune: one independently verified alternative
+NFQWS2_ENABLE=1
+NFQWS2_PORTS_TCP=443
+NFQWS2_PORTS_UDP=
+NFQWS2_OPT='--filter-tcp=443 --filter-l7=tls --hostlist=$OWN/youtube.txt $args'
+DISABLE_CUSTOM=1
+DISABLE_IPV6=1
+MODE_FILTER=none
+FLOWOFFLOAD=donttouch
+OPENWRT_WAN4='$WAN_NETWORK'
+EOF
+        mv "$RUN/config.new" "$CONFIG"
+        sha256sum "$CONFIG" > "$BACKUP/config.sha256"
+    fi
 }
 
 probe() {
-    target=$1; kind=$2; expected=$3; minbytes=$4
-    if [ "$kind" = quic ]; then opt=--http3-only; else opt=--http2; fi
-    metrics=$("$CURL_BIN" --interface "$WAN_DEV" --noproxy '*' -4 "$opt" \
+    p_target=$1; p_expected=$2; p_min=$3
+    p_metrics=$(curl --interface "$WAN_DEV" --noproxy '*' -4 --http1.1 \
       --connect-timeout 5 --max-time 20 -sS -o /dev/null \
-      -w '%{http_code} %{size_download} %{http_version}' "https://$target") || return 1
-    set -- $metrics
-    say "$kind $target: HTTP $1, $2 bytes, HTTP/$3"
-    printf '%s\n' "$kind $target $metrics" >> "$BACKUP/verification.log"
-    [ "$1" = "$expected" ] && [ "$2" -ge "$minbytes" ] || return 1
-    [ "$kind" != quic ] || [ "$3" = 3 ]
+      -w '%{http_code} %{size_download}' "https://$p_target") || return 1
+    printf '%s %s\n' "$p_target" "$p_metrics" >> "$BACKUP/installed-verification.log"
+    set -- $p_metrics
+    case "$p_expected:$1" in 200:200|endpoint:200|endpoint:404|endpoint:405) ;; *) return 1;; esac
+    awk -v actual="$2" -v minimum="$p_min" 'BEGIN {exit !(actual>=minimum)}'
 }
 
-verify() {
-    say 'Проверка после применения (TCP, полные тела ответов).'
-    for n in $(seq 1 "$REPEATS"); do
-        probe www.youtube.com/ tcp 200 10000 || die 'Не прошла загрузка страницы.'
-        probe i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg tcp 200 1000 || die 'Не прошла загрузка превью.'
-        # The API root is not an API request: 404/405 are valid server replies, not API functionality proof.
-        metrics=$("$CURL_BIN" --interface "$WAN_DEV" --noproxy '*' -4 --max-time 10 -sS -o /dev/null -w '%{http_code}' https://youtubei.googleapis.com/) || die 'Нет ответа API endpoint.'
-        case "$metrics" in 200|404|405) ;; *) die "Неожиданный ответ API: $metrics";; esac
+verify_installed() {
+    for attempt in 1 2 3; do
+        probe www.youtube.com/ 200 10000 || return 1
+        probe i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg 200 1000 || return 1
+        probe youtubei.googleapis.com/ endpoint 0 || return 1
+        probe redirector.googlevideo.com/ endpoint 0 || return 1
     done
-    if [ "$QUIC_STATUS" = selected ]; then
-        for n in $(seq 1 "$REPEATS"); do
-            probe www.youtube.com/ quic 200 10000 && probe i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg quic 200 1000 || die 'QUIC не прошёл финальную проверку.'
-        done
-    fi
     if [ -n "$MEDIA_FILE" ]; then
-        [ -f "$MEDIA_FILE" ] || die 'Нет файла media URL.'
-        if LC_ALL=C grep -q '[[:cntrl:]]' "$MEDIA_FILE"; then die 'Media URL содержит управляющие символы.'; fi
-        [ "$(awk 'END {print NR}' "$MEDIA_FILE")" -le 1 ] || die 'В media URL должна быть одна строка.'
-        url=$(cat "$MEDIA_FILE")
-        case "$url" in https://*/*) ;; *) die 'Нужен HTTPS media URL.';; esac
-        host=${url#https://}; host=${host%%/*}
-        case "$host" in *[!A-Za-z0-9.-]*|'') die 'Некорректный media host.';; *.googlevideo.com) ;; *) die 'Media URL должен вести на googlevideo.com.';; esac
-        case "$url" in *'"'*|*'\'*) die 'Некорректный media URL.';; esac
-        printf 'url = "%s"\n' "$url" > "$RUN/media.curl"
-        for n in 1 2 3; do
-            m=$("$CURL_BIN" --config "$RUN/media.curl" --interface "$WAN_DEV" --noproxy '*' -4 --http2 --range 0-1048575 --max-time 30 -sS -o /dev/null -w '%{http_code} %{size_download} %{content_type}') || die 'Ошибка загрузки media.'
-            set -- $m
-            case "$1/$3" in 206/video/*|200/video/*|206/audio/*|200/audio/*) ;; *) die 'Ответ не похож на media.';; esac
-            [ "$2" -ge 65536 ] || die 'Media ответ слишком короткий.'
-            say "Media: HTTP $1, $2 bytes, $3"
-        done
+        # URL kept in a root-only curl config, never included in logs/argv.
+        m=$(curl --config "$RUN/media.curl" --interface "$WAN_DEV" --noproxy '*' -4 \
+          --range 0-1048575 --max-time 30 -sS -o /dev/null -w '%{http_code} %{size_download} %{content_type}') || return 1
+        set -- $m
+        case "$1/$3" in 206/video/*|200/video/*|206/audio/*|200/audio/*) ;; *) return 1;; esac
+        [ "$2" -ge 65536 ] || return 1
     fi
-    sha256sum -c "$BACKUP/recovery.sha256"
-    sing-box check -c /etc/sing-box/config.json
-    pidof sing-box >/dev/null
-    # Commit only once the real WAN verification has passed.
-    if ! sha256sum -c "$BACKUP/podkop.before.sha256" >/dev/null || ! sha256sum -c "$BACKUP/zapret2.disk.sha256" >/dev/null; then
-        CONFLICT=1; die 'Конфигурация изменена другим процессом во время подбора.'
+}
+
+prepare_media() {
+    [ -n "$MEDIA_FILE" ] || return 0
+    [ -f "$MEDIA_FILE" ] || die 'Нет файла media URL.'
+    [ "$(awk 'END {print NR}' "$MEDIA_FILE")" -le 1 ] || die 'Ожидается одна строка media URL.'
+    url=$(cat "$MEDIA_FILE")
+    case "$url" in *[![:print:]]*|*'"'*|*'\\'*) die 'Недопустимые символы media URL.';; esac
+    case "$url" in https://*/*) ;; *) die 'Нужен HTTPS media URL.';; esac
+    host=${url#https://}; host=${host%%/*}
+    case "$host" in *[!A-Za-z0-9.-]*|'') die 'Недопустимый media host.';; *.googlevideo.com) ;; *) die 'Нужен домен *.googlevideo.com.';; esac
+    printf 'url = "%s"\n' "$url" > "$RUN/media.curl"
+}
+
+apply_profiles() {
+    assert_unchanged
+    CHANGED=1; : > "$BACKUP/changed"
+    mkdir -p "$OWN"
+    printf 'zapret2-youtube-autotune\n' > "$OWN/owner"
+    printf '%s\n' youtube.com youtu.be ytimg.com googlevideo.com youtubei.googleapis.com youtube.googleapis.com > "$OWN/youtube.txt"
+    chmod 755 "$OWN"; chmod 644 "$OWN/youtube.txt"
+    accepted=0; trial=0
+    while IFS= read -r args; do
+        trial=$((trial+1))
+        "$BASE/nfq2/nfqws2" --dry-run --qnum=300 \
+          "--lua-init=@$BASE/lua/zapret-lib.lua" "--lua-init=@$BASE/lua/zapret-antidpi.lua" \
+          --filter-tcp=443 --filter-l7=tls "--hostlist=$OWN/youtube.txt" $args > "$BACKUP/dry-run-$trial.log" 2>&1 || continue
+        n=$((accepted+1))
+        assert_unchanged
+        stage_profile "$n" "$args"
+        /etc/init.d/zapret2 start > "$BACKUP/start-$trial.log" 2>&1 || die 'Не удалось запустить zapret2.'
+        passed=0
+        sleep 2
+        if pidof nfqws2 >/dev/null && verify_installed; then passed=1; fi
+        /etc/init.d/zapret2 stop >> "$BACKUP/start-$trial.log" 2>&1 || die 'Не удалось остановить пробный профиль.'
+        # Detect concurrent writes before reverting our staged UCI delta.
+        sha256sum -c "$BACKUP/config.sha256" >/dev/null || { : > "$BACKUP/conflict"; die 'Параллельная запись конфигурации.'; }
+        if [ "$LAYOUT" = uci ]; then
+            uci changes zapret2 > "$RUN/current.changes"
+            cmp -s "$RUN/current.changes" "$BACKUP/planned.changes" || { : > "$BACKUP/conflict"; die 'Параллельные UCI-изменения.'; }
+            uci revert zapret2
+        fi
+        if [ "$passed" = 1 ]; then
+            accepted=$n
+            printf '%s\n' "$args" > "$BACKUP/strategy-$n.txt"
+            say "Стратегия $n прошла независимую проверку через службу."
+        fi
+        [ "$accepted" -lt "$WANT" ] || break
+    done < "$RUN/selected"
+    [ "$accepted" -ge 2 ] || die 'Через службу прошли меньше двух стратегий; откат.'
+    for n in 1 2 3; do
+        rm -f "$OWN/strategy-$n.txt"
+        [ ! -f "$BACKUP/strategy-$n.txt" ] || cp "$BACKUP/strategy-$n.txt" "$OWN/strategy-$n.txt"
+    done
+    assert_unchanged
+    if [ "$LAYOUT" = uci ]; then
+        for n in 1 2 3; do uci -q delete "zapret2.yta_$n" || true; done
+        for n in $(seq 1 "$accepted"); do stage_profile "$n" "$(cat "$BACKUP/strategy-$n.txt")"; done
+        disable_strategies
+        uci set zapret2.yta_1.enabled=1
+        uci commit zapret2
+    else stage_profile 1 "$(cat "$BACKUP/strategy-1.txt")"
     fi
-    uci changes podkop > "$RUN/podkop.changes"
-    uci changes zapret2 > "$RUN/zapret2.changes"
-    if ! cmp -s "$RUN/podkop.changes" "$BACKUP/planned-podkop.changes" || ! cmp -s "$RUN/zapret2.changes" "$BACKUP/planned-zapret2.changes"; then
-        CONFLICT=1; die 'Во время подбора появились посторонние UCI-изменения.'
-    fi
-    uci commit podkop
-    uci commit zapret2
+    /etc/init.d/zapret2 start > "$BACKUP/final-start.log" 2>&1 || die 'Не удалось включить итоговую стратегию.'
+    sleep 2
+    pidof nfqws2 >/dev/null || die 'Итоговая стратегия не запущена.'
     /etc/init.d/zapret2 enable
-    cp "$RUN/main-selected" "$BACKUP/selected-main.txt"
-    cp "$RUN/api-selected" "$BACKUP/selected-api.txt"
-    [ ! -s "$RUN/quic-selected" ] || cp "$RUN/quic-selected" "$BACKUP/selected-quic.txt"
-    printf '%s\n' "$QUIC_STATUS" > "$BACKUP/quic-status"
     SUCCESS=1
-    say "Готово: TCP установлен. QUIC: $QUIC_STATUS. Backup: $BACKUP"
-    say 'Проверьте приложение на LAN-устройстве. Успех страницы/превью не доказывает работу всех CDN, 4K или QUIC media.'
+    : > "$BACKUP/finished"
+    say "Готово: $accepted разных проверенных стратегий, включена только первая."
+    say "Стратегии: $OWN/strategy-N.txt; backup и логи: $BACKUP"
+    say 'Проверены IPv4 TCP/TLS, страница, превью и ответы endpoint API/CDN. QUIC/IPv6 не тестировались.'
+    if [ -z "$MEDIA_FILE" ]; then say 'Поток видео не тестировался: для него нужен свежий --media-url-file и проверка на LAN-устройстве.'; fi
 }
 
 main() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --help|-h) help; return;; --version) say "$VERSION"; return;;
-            --check) MODE=check;; --preset) MODE=preset;; --clean-temp) MODE=clean;;
-            --no-quic) QUIC=0;; --require-quic) REQUIRE_QUIC=1;;
-            --section|--wan-network|--curl|--media-url-file)
+            --help|-h) help; return;; --version) say "$VERSION"; return;; --check) MODE=check;;
+            --no-quic) :;;
+            --base|--wan-network|--want|--scan-seconds|--media-url-file)
                 [ "$#" -ge 2 ] || die "Нет значения $1"
                 opt=$1; shift
-                case "$opt" in --section) SECTION=$1;; --wan-network) WAN_NETWORK=$1;; --curl) CURL_BIN=$1;; --media-url-file) MEDIA_FILE=$1;; esac;;
+                case "$opt" in --base) BASE=$1;; --wan-network) WAN_NETWORK=$1;; --want) WANT=$1;; --scan-seconds) TIME_LIMIT=$1;; --media-url-file) MEDIA_FILE=$1;; esac;;
             --rollback)
-                [ "$#" = 2 ] || die 'Укажите только --rollback и путь копии.'
+                [ "$#" = 2 ] || die 'Нужны только --rollback и backup.'
                 resolved=$(readlink -f "$2")
-                case "$resolved" in /root/zapret2-youtube-backup-*) ;; *) die 'Недопустимый путь backup.';; esac
-                [ -f "$resolved/rollback.sh" ] || die 'Нет rollback.sh.'
+                case "$resolved" in /root/zapret2-youtube-backup-*) ;; *) die 'Недопустимый backup.';; esac
                 exec sh "$resolved/rollback.sh";;
             *) die "Неизвестный параметр: $1";;
         esac
         shift
     done
-    valid_name "$SECTION" && valid_name "$WAN_NETWORK" || die 'Некорректное имя секции/WAN.'
-    if [ "$MODE" = clean ]; then
-        [ "$(id -u)" = 0 ] || die 'Запустите от root.'
-        mkdir "$LOCK" 2>/dev/null || die 'Есть lock подбора; очистка не запущена.'
-        LOCK_HELD=1
-        trap cleanup EXIT
-        clean_stale_downloads
-        say 'Архивы/curl неактивных запусков очищены. Конфигурация не менялась.'
-        return
-    fi
-    [ "$MODE" != check ] || { audit; return; }
-    [ "$REQUIRE_QUIC" = 0 ] || [ "$QUIC" = 1 ] || die '--require-quic несовместим с --no-quic.'
+    banner
+    valid_name "$WAN_NETWORK" || die 'Недопустимое имя WAN.'
+    case "$WANT" in 2|3) ;; *) die '--want: только 2 или 3.';; esac
+    case "$TIME_LIMIT" in ''|*[!0-9]*) die 'Некорректный --scan-seconds.';; esac
+    [ "$TIME_LIMIT" -ge 10 ] && [ "$TIME_LIMIT" -le 7200 ] || die 'Лимит сканирования: 10–7200 секунд.'
     preflight
-    backup
+    [ "$MODE" != check ] || return 0
     trap cleanup EXIT
     trap 'exit 130' HUP INT TERM
-    clean_stale_downloads
-    check_memory
-    ensure_zapret2
-    ensure_curl
+    backup
     write_assets
-    prepare_podkop
-    check_memory
+    prepare_media
+    prepare_blockcheck
     choose
     apply_profiles
-    verify
 }
 
 write_assets() {
     cat > "$RUN/select.awk" <<'YTA_SELECT_AWK'
-# Accept only allowlisted commands with every repeat successful on every target.
-BEGIN {
-    while ((getline t < targets) > 0) if (t != "") { wanted[t] = 1; nt++ }
-    close(targets)
-    if (nt == 0 || repeats < 2) exit 3
+# Strict native Blockcheck2 parser. SUMMARY and baseline are never trials.
+function safe(s,    n,a,i) {
+    # Custom Blockcheck2 uses eval internally: admit only inert argv tokens.
+    if (s == "" || s ~ /[^A-Za-z0-9_.,:+=\/@ -]/) return 0
+    n=split(s,a,/ +/)
+    for(i=1;i<=n;i++) {
+        if(a[i] ~ /^--payload=tls_client_hello$/) continue
+        if(a[i] ~ /^--lua-desync=[A-Za-z0-9_.,:+=\/@-]+$/) continue
+        if(a[i] ~ /^--(out-range|in-range|out-seq|in-seq)=[A-Za-z0-9_.,:+=-]+$/) continue
+        return 0
+    }
+    return index(s,"--lua-desync=") > 0
 }
-NR == FNR { if ($0 != "" && $0 !~ /^#/) { allowed[$0] = 1; order[$0] = NR }; next }
-/^- curl_test_/ {
-    current = ""; count = 0; failed = 0
-    for (i in seen) delete seen[i]
-    prefix = "- " protocol " ipv4 "
-    if (index($0, prefix) != 1) next
-    n = split($0, parts, / : nfqws2 /)
-    if (n != 2 || !(parts[2] in allowed)) next
-    domain = substr(parts[1], length(prefix) + 1)
-    if (!(domain in wanted)) next
-    current = parts[2]
+BEGIN {
+    while ((getline t < targets) > 0) if (t != "" && !(t in wanted)) { wanted[t]=1; nt++ }
+    close(targets)
+}
+FILENAME==ARGV[1] { if($0!="" && $0!~/^#/) allowed[$0]=1; next }
+/^- / || /^\* / || /^curl_test_/ {
+    current=""; count=0; failed=0
+    for(i in seen) delete seen[i]
+    prefix="- " protocol " ipv4 "
+    if(index($0,prefix)!=1) next
+    n=split($0,parts,/ : nfqws2 /)
+    if(n!=2 || !safe(parts[2]) || (!discover && !(parts[2] in allowed))) next
+    domain=substr(parts[1],length(prefix)+1)
+    if(!(domain in wanted)) next
+    current=parts[2]
+    if(!(current in order)) {order[current]=++ns; ordered[ns]=current}
     blocks[current SUBSEP domain]++
     next
 }
-current != "" {
-    if (index($0, "UNAVAILABLE") || index($0, "curl: (")) failed = 1
-    if ($0 ~ /\[attempt [0-9]+\] AVAILABLE/) {
-        k = $0; sub(/.*\[attempt /, "", k); sub(/\].*/, "", k)
-        if (k >= 1 && k <= repeats && !(k in seen)) { seen[k] = 1; count++ }
+current!="" {
+    if(index($0,"UNAVAILABLE") || index($0,"curl: (")) failed=1
+    if($0~/\[attempt [0-9]+\] AVAILABLE/) {
+        k=$0; sub(/.*\[attempt /,"",k); sub(/\].*/,"",k)
+        if(k>=1 && k<=repeats && !(k in seen)) {seen[k]=1;count++}
     }
-    if ($0 == "!!!!! AVAILABLE !!!!!" && !failed && count == repeats)
-        passed[current SUBSEP domain] = 1
+    if($0=="!!!!! AVAILABLE !!!!!") {
+        if(!failed && count==repeats) passed[current SUBSEP domain]=1
+        current=""
+    }
 }
 END {
-    if (nt == 0 || repeats < 2) exit 3
-    best = ""; bestcost = 1000000000
-    for (s in allowed) {
-        ok = 1
-        for (t in wanted) if (!((s SUBSEP t) in passed) || blocks[s SUBSEP t] != 1) ok = 0
-        if (!ok) continue
-        # Prefer no fake injection, then simpler/shorter arguments. No claim of global optimality.
-        cost = (index(s, "--lua-desync=fake:") > 0) * 100000 + length(s)
-        if (best == "" || cost < bestcost || (cost == bestcost && order[s] < order[best])) {
-            best = s; bestcost = cost
-        }
+    if(nt==0 || repeats<2) exit 3
+    found=0
+    for(j=1;j<=ns;j++) {
+        s=ordered[j];ok=1
+        for(t in wanted) if(!passed[s SUBSEP t] || blocks[s SUBSEP t]!=1) ok=0
+        if(ok) {print s;found++}
     }
-    if (best == "") exit 2
-    print best
+    if(!found) exit 2
 }
 YTA_SELECT_AWK
-    cat > "$RUN/tcp.txt" <<'YTA_TCP_TXT'
---payload=tls_client_hello --lua-desync=multidisorder:pos=1,midsld
---payload=tls_client_hello --lua-desync=multidisorder:pos=1,host+1,midsld
---payload=tls_client_hello --lua-desync=multisplit:pos=1
---payload=tls_client_hello --lua-desync=multisplit:pos=2
---payload=tls_client_hello --lua-desync=multisplit:pos=1,midsld
---payload=tls_client_hello --lua-desync=multidisorder:pos=1
---payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5 --lua-desync=multisplit:pos=1,midsld
---payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_seq=-3000 --lua-desync=multisplit:pos=1,midsld
---payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:ip_ttl=4 --lua-desync=multisplit:pos=1,midsld
---payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:ip_ttl=5 --lua-desync=multisplit:pos=1,midsld
---payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:ip_ttl=6 --lua-desync=multisplit:pos=1,midsld
---payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:badsum --lua-desync=multidisorder:pos=1,midsld
-YTA_TCP_TXT
-    cat > "$RUN/quic.txt" <<'YTA_QUIC_TXT'
---payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=6
---payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=11
---blob=yta_quic:@/opt/zapret2/files/fake/quic_initial_www_google_com.bin --payload=quic_initial --lua-desync=fake:blob=yta_quic:repeats=6
---blob=yta_quic:@/opt/zapret2/files/fake/quic_initial_www_google_com.bin --payload=quic_initial --lua-desync=fake:blob=yta_quic:repeats=11
---blob=yta_quic:@/opt/zapret2/files/fake/quic_initial_www_google_com.bin --payload=quic_initial --lua-desync=fake:blob=yta_quic:repeats=6:ip_ttl=4
---blob=yta_quic:@/opt/zapret2/files/fake/quic_initial_www_google_com.bin --payload=quic_initial --lua-desync=fake:blob=yta_quic:repeats=6:ip_ttl=5
---blob=yta_quic:@/opt/zapret2/files/fake/quic_initial_www_google_com.bin --payload=quic_initial --lua-desync=fake:blob=yta_quic:repeats=6:ip_ttl=6
---payload=quic_initial --lua-desync=send:ipfrag:ipfrag_pos_udp=8 --lua-desync=drop
---payload=quic_initial --lua-desync=send:ipfrag:ipfrag_pos_udp=16 --lua-desync=drop
---payload=quic_initial --lua-desync=send:ipfrag:ipfrag_pos_udp=32 --lua-desync=drop
---payload=quic_initial --lua-desync=send:ipfrag:ipfrag_pos_udp=64 --lua-desync=drop
-YTA_QUIC_TXT
-    cat > "$RUN/main-hosts.txt" <<'YTA_MAIN_HOSTS_TXT'
-youtube.com
-youtu.be
-youtube-nocookie.com
-youtubekids.com
-googlevideo.com
-ytimg.com
-yt3.ggpht.com
-yt4.ggpht.com
-yt1.googleusercontent.com
-yt2.googleusercontent.com
-yt3.googleusercontent.com
-yt4.googleusercontent.com
-wide-youtube.l.google.com
-youtube-ui.l.google.com
-yt-video-upload.l.google.com
-ytimg.l.google.com
-ytstatic.l.google.com
-YTA_MAIN_HOSTS_TXT
-    cat > "$RUN/api-hosts.txt" <<'YTA_API_HOSTS_TXT'
-youtubei.googleapis.com
-youtube.googleapis.com
-YTA_API_HOSTS_TXT
 }
 
 if [ "${YTA_LIBRARY_ONLY:-0}" != 1 ]; then main "$@"; fi

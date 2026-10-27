@@ -1,129 +1,149 @@
-"""Exercise the real shell preparation functions with a stateful UCI fixture."""
-import json
+"""Exercise actual transaction functions with inert local service/UCI fixtures."""
 import os
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 import unittest
+import sys
+import json
 
-ROOT = Path(__file__).resolve().parents[1]
-COMPONENTS = 'geoblock block porn news anime hdrezka tiktok meta twitter discord'.split()
-
-# Re-index anonymous sections on every call, as UCI does after delete.
-UCI = r'''
-import json, os, sys
-from pathlib import Path
-p = Path(os.environ['UCI_STATE'])
-state = json.loads(p.read_text())
-a = [x for x in sys.argv[1:] if x != '-q']
-cmd, key = a[0], a[1]
-def sections(package):
-    counts = {}
-    for section in state[package]:
-        kind = section['type']
-        index = counts.get(kind, 0)
-        counts[kind] = index + 1
-        yield section.get('name') or f'@{kind}[{index}]', section
-if cmd == 'show':
-    for name, section in sections(key):
-        print(f'{key}.{name}={section["type"]}')
-    sys.exit(0)
-package, name, *option = key.split('.', 2)
-value = None
-if cmd in ('set', 'add_list'):
-    option[0], value = option[0].split('=', 1)
-section = next(s for n, s in sections(package) if n == name)
-options = section.setdefault('options', {})
-if cmd == 'get':
-    result = options.get(option[0]) if option else section['type']
-    if result is None: sys.exit(1)
-    print(' '.join(result) if isinstance(result, list) else result)
-elif cmd == 'delete':
-    if option:
-        if option[0] not in options: sys.exit(1)
-        del options[option[0]]
-    else: state[package].remove(section)
-elif cmd == 'set': options[option[0]] = value
-elif cmd == 'add_list': options.setdefault(option[0], []).append(value)
-else: raise ValueError(cmd)
-p.write_text(json.dumps(state))
-'''
+ROOT=Path(__file__).resolve().parents[1]
+SAFE='--payload=tls_client_hello --lua-desync=multisplit:pos=1'
 
 
-class PreparationTests(unittest.TestCase):
+class TransactionTests(unittest.TestCase):
     def shell(self, command):
-        return subprocess.run(['sh', '-c', '. "$1"; ' + command, 'test',
-                               (ROOT / 'install.sh').as_posix()],
-                              env=dict(os.environ, YTA_LIBRARY_ONLY='1'),
-                              text=True, capture_output=True)
+        # Git for Windows supplies sh/awk, but not always sha256sum.
+        shim = ('sha256sum() { "$YTA_PYTHON" "$YTA_HASH" "$@"; }; '
+                'mkdir() { for arg in "$@"; do [ "$arg" = -p ] || '
+                '''"$YTA_PYTHON" -c 'import os,sys; os.makedirs(sys.argv[1],exist_ok=True)' "$arg"; done; }; ''')
+        if os.name == 'nt':
+            shim += 'chmod() { :; }; '
+        return subprocess.run(['sh','-c','. "$1"; '+shim+command,'test',(ROOT/'install.sh').as_posix()],
+            env=dict(os.environ,YTA_LIBRARY_ONLY='1',YTA_PYTHON=Path(sys.executable).as_posix(),
+                     YTA_HASH=(ROOT/'tests/hash_fixture.py').as_posix()),
+            capture_output=True, text=True, encoding='utf-8')
 
-    def test_low_ram_stops_before_download(self):
-        r = self.shell('awk() { echo 8080; }; curl() { echo no-http3; }; check_memory')
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn('8080', r.stdout)
+    def test_banner_lists_all_manual_requirements_with_color(self):
+        r=self.shell('banner')
+        self.assertEqual(r.returncode, 0)
+        for word in ['\x1b[', 'ОСТАНОВЛЕНА', 'podcop', 'forcop', 'forkozz', 'steer', 'FakeIP']:
+            self.assertIn(word, r.stdout)
 
-    def test_http3_download_needs_more_headroom_than_tcp(self):
-        base = 'awk() { echo 60000; }; curl() { echo no-http3; }; '
-        self.assertNotEqual(self.shell(base + 'check_memory').returncode, 0)
-        self.assertEqual(self.shell(base + 'QUIC=0; check_memory').returncode, 0)
+    def test_preparation_does_not_modify_other_bypasses(self):
+        core=(ROOT/'src/core.sh').read_text(encoding='utf-8')
+        self.assertNotIn('uci commit podkop',core)
+        self.assertNotIn('opkg install',core)
+        self.assertNotIn('apk add',core)
+        self.assertNotIn('killall',core)
 
-    def test_cleanup_removes_downloads_but_retains_other_files(self):
-        r = self.shell('d=/tmp/zapret2-youtube-autotune-$$; mkdir "$d"; '
-                       'trap \'rm -f "$d/curl.tar" "$d/keep"; rmdir "$d"\' EXIT; '
-                       'touch "$d/curl.tar" "$d/keep"; remove_run_downloads "$d"; '
-                       '[ ! -e "$d/curl.tar" ] && [ -f "$d/keep" ]; '
-                       '! remove_run_downloads /tmp/unrelated')
-        self.assertEqual(r.returncode, 0, r.stderr)
-
-    def run_preparation(self, state, command):
+    def test_native_hook_calls_real_engine_then_cleans_before_early_exit(self):
         with tempfile.TemporaryDirectory() as d:
-            d = Path(d)
-            fixture, data = d / 'uci.py', d / 'state.json'
-            fixture.write_text(UCI, encoding='utf-8')
-            data.write_text(json.dumps(state), encoding='utf-8')
-            env = dict(os.environ, YTA_LIBRARY_ONLY='1', UCI_STATE=str(data),
-                       UCI_FIXTURE=fixture.as_posix(), PYTHON_BIN=Path(sys.executable).as_posix())
-            shell = '. "$1"; uci() { "$PYTHON_BIN" "$UCI_FIXTURE" "$@"; }; ' + command
-            result = subprocess.run(['sh', '-c', shell, 'test', (ROOT / 'install.sh').as_posix()],
-                                    env=env, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            return json.loads(data.read_text())
+            p=Path(d)
+            for sub in ['base/blockcheck2.d/standard','base/blockcheck2.d/custom','run']:
+                (p/sub).mkdir(parents=True)
+            (p/'base/blockcheck2.sh').write_text('#!/bin/sh\n')
+            (p/'base/blockcheck2.d/standard/def.inc').write_text('# fixture\n')
+            (p/'base/blockcheck2.d/custom/10-list.sh').write_text('# fixture\n')
+            r=self.shell(f'BASE="{p.as_posix()}/base"; RUN="{p.as_posix()}/run"; WAN_DEV=wan; '
+                'prepare_blockcheck; . "$RUN/bc/blockcheck2.d/discover/00-yta.sh"; '
+                'pktws_curl_test() { echo real-trial; return 0; }; '
+                'unprepare_all() { echo cleaned; }; '
+                'YTA_OK=7; pktws_curl_test_update tls youtube --lua-desync=multisplit:pos=1; echo unreachable')
+            self.assertEqual(r.returncode,0,r.stderr)
+            self.assertEqual(r.stdout.splitlines(),['real-trial','cleaned'])
 
-    def test_removes_named_and_reindexed_anonymous_strategies(self):
-        main = {'name': 'main', 'type': 'zapret2', 'options': {'custom_scripts': '1', 'flowoffload': 'donttouch'}}
-        hostlist = {'name': 'old_hosts', 'type': 'list', 'options': {'path': '/etc/old.txt'}}
-        state = {'zapret2': [main, {'type': 'strategy'}, {'name': 'user', 'type': 'strategy'},
-                             {'type': 'strategy'}, hostlist]}
-        out = self.run_preparation(state, 'clear_zapret_strategies; clear_zapret_strategies')
-        self.assertEqual(out['zapret2'], [dict(main, options={**main['options'], 'enabled': '0', 'custom_scripts': '0'}), hostlist])
+    def test_shell_profile_is_standalone_and_original_is_preserved(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)
+            (p/'original-config').write_text('NFQWS2_OPT="old\nargs"\nNFQWS2_ENABLE=0\n')
+            r=self.shell(f'LAYOUT=shell; BACKUP="{p.as_posix()}"; RUN="$BACKUP"; '
+                'CONFIG="$BACKUP/config"; OWN=/etc/zapret2-youtube-autotune; '
+                f"stage_profile 1 '{SAFE}'; "
+                '. "$CONFIG"; printf "%s\\n" "$NFQWS2_ENABLE" "$DISABLE_CUSTOM" "$NFQWS2_OPT"')
+            self.assertEqual(r.returncode,0,r.stderr)
+            self.assertIn('1\n1\n--filter-tcp=443',r.stdout)
+            self.assertIn(SAFE,r.stdout)
+            self.assertIn('old', (p/'original-config').read_text())
 
-    def test_expands_all_affected_sections_and_keeps_custom_settings(self):
-        def section(name, lists):
-            return {'name': name, 'type': 'section', 'options': {'community_lists': lists,
-                    'interface': 'awg1', 'user_domain_list': ['example.org'], 'connection_type': 'vpn'}}
-        state = {'podkop': [section('main', ['russia_inside', 'telegram', 'meta']),
-                            section('extra', ['youtube', 'cloudflare']), section('xbox', ['google_play'])]}
-        out = self.run_preparation(state, 'prepare_community_lists; prepare_community_lists')
-        self.assertEqual(out['podkop'][0]['options']['community_lists'], COMPONENTS + ['telegram'])
-        self.assertEqual(out['podkop'][1]['options']['community_lists'], ['cloudflare'])
-        self.assertEqual(out['podkop'][2], state['podkop'][2])
-        for before, after in zip(state['podkop'], out['podkop']):
-            for key in ('interface', 'user_domain_list', 'connection_type'):
-                self.assertEqual(after['options'][key], before['options'][key])
+    def test_uci_reserved_names_are_checked_before_writing_owner(self):
+        r=self.shell('uci() { printf "%s\\n" "$*"; }; disable_strategies() { echo disable-all; }; '
+            'OWN=/tmp/nonexistent-yta-fixture; guard_reserved_sections')
+        # Fixture get must fail to indicate no pre-existing reserved names.
+        self.assertNotEqual(r.returncode,0)
+        self.assertIn('уже существует',r.stderr)
 
-    def test_youtube_only_section_can_become_empty(self):
-        state = {'podkop': [{'type': 'section', 'options': {'community_lists': ['youtube']}}]}
-        out = self.run_preparation(state, 'prepare_community_lists')
-        self.assertNotIn('community_lists', out['podkop'][0]['options'])
+    def test_concurrent_config_edit_fails_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d); (p/'config').write_text('new external config')
+            r=self.shell(f'BACKUP="{p.as_posix()}"; LAYOUT=shell; '
+                'printf "bad  %s/config\\n" "$BACKUP" > "$BACKUP/config.sha256"; assert_unchanged')
+            self.assertNotEqual(r.returncode,0)
+            self.assertTrue((p/'conflict').exists())
+            self.assertEqual((p/'config').read_text(),'new external config')
 
-    def test_backup_and_stop_precede_strategy_removal(self):
-        core = (ROOT / 'src/core.sh').read_text(encoding='utf-8')
-        main = core[core.index('main() {'):]
-        self.assertLess(main.index('    backup\n'), main.index('    prepare_podkop\n'))
-        prepare = core[core.index('prepare_podkop() {'):core.index('\nscan() {')]
-        self.assertLess(prepare.index('/etc/init.d/zapret2 stop'), prepare.index('    clear_zapret_strategies'))
+    def test_three_uci_profiles_are_independent_and_one_is_enabled(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)
+            state={'main':{'type':'zapret2','options':{}},
+                   'user_strategy':{'type':'strategy','options':{'enabled':'1','script':'keep me'}}}
+            (p/'uci.json').write_text(json.dumps(state))
+            command=(f'export YTA_UCI_STATE="{p.as_posix()}/uci.json"; '
+                f'uci() {{ "$YTA_PYTHON" "{(ROOT/"tests/uci_fixture.py").as_posix()}" "$@"; }}; '
+                f'LAYOUT=uci; BACKUP="{p.as_posix()}"; OWN=/etc/zapret2-youtube-autotune; '
+                f"stage_profile 1 '{SAFE}'; stage_profile 2 '{SAFE.replace('pos=1','pos=2')}'; "
+                f"stage_profile 3 '{SAFE.replace('pos=1','pos=3')}'; "
+                'disable_strategies; uci set zapret2.yta_1.enabled=1')
+            r=self.shell(command)
+            self.assertEqual(r.returncode,0,r.stderr)
+            out=json.loads((p/'uci.json').read_text())
+            self.assertEqual([k for k,v in out.items() if v['type']=='strategy' and v['options']['enabled']=='1'], ['yta_1'])
+            self.assertEqual(len({out[f'yta_{n}']['options']['script'] for n in (1,2,3)}),3)
+            self.assertEqual(out['user_strategy']['options']['script'],'keep me')
+
+    def test_actual_generated_rollback_restores_original_and_stays_stopped(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d); base=p/'base'; base.mkdir()
+            own=p/'own'; own.mkdir()
+            (own/'strategy-3.txt').write_text('new strategy')
+            original='NFQWS2_ENABLE=0\nNFQWS2_OPT="original"\n'
+            (p/'original-config').write_text(original)
+            (base/'config').write_text('changed')
+            for name,value in [('config-path',(base/'config').as_posix()),('base-path',base.as_posix()),
+                               ('layout','shell'),('was-enabled','0')]:
+                (p/name).write_text(value+'\n')
+            service=p/'service.sh'
+            service.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{p.as_posix()}/service.log"\n')
+            core=(ROOT/'src/core.sh').read_text(encoding='utf-8')
+            script=core.split("<<'ROLLBACK'\n",1)[1].split('\nROLLBACK',1)[0]
+            script=script.replace('[ "$(id -u)" = 0 ] || exit 1', ':')
+            script=script.replace('/etc/init.d/zapret2',f'sh "{service.as_posix()}"')
+            script=script.replace('/etc/zapret2-youtube-autotune',own.as_posix())
+            (p/'rollback.sh').write_text(script,encoding='utf-8')
+            for _ in range(2):
+                r=subprocess.run(['sh',(p/'rollback.sh').as_posix()],capture_output=True,text=True,encoding='utf-8')
+                self.assertEqual(r.returncode,0,r.stderr)
+            self.assertEqual((base/'config').read_text(),original)
+            self.assertFalse((own/'strategy-3.txt').exists())
+            self.assertEqual((p/'service.log').read_text().splitlines(),['stop','disable','stop','disable'])
+
+    def test_cleanup_restores_and_propagates_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)
+            (p/'rollback.sh').write_text(f'#!/bin/sh\nprintf restored > "{p.as_posix()}/restored"\n')
+            r=self.shell(f'BACKUP="{p.as_posix()}"; CHANGED=1; trap cleanup EXIT; exit 7')
+            self.assertEqual(r.returncode,7,r.stderr)
+            self.assertTrue((p/'restored').exists())
+            self.assertTrue((p/'finished').exists())
+
+    def test_cleanup_does_not_rollback_over_conflict(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d); (p/'conflict').touch()
+            (p/'rollback.sh').write_text(f'printf bad > "{p.as_posix()}/overwritten"\n')
+            r=self.shell(f'BACKUP="{p.as_posix()}"; CHANGED=1; trap cleanup EXIT; exit 9')
+            self.assertEqual(r.returncode,9)
+            self.assertFalse((p/'overwritten').exists())
 
 
-if __name__ == '__main__':
+if __name__=='__main__':
     unittest.main()

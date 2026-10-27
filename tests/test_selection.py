@@ -1,16 +1,18 @@
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+A = '--payload=tls_client_hello --lua-desync=multisplit:pos=1'
+B = '--payload=tls_client_hello --lua-desync=multidisorder:pos=1,midsld'
+C = '--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5'
 
 
-def block(strategy, target='www.youtube.com', attempts=5, fail=None):
-    lines = [f'- curl_test_https_tls13 ipv4 {target} : nfqws2 {strategy}']
+def block(strategy, target='www.youtube.com', attempts=3, fail=None, proto='tls13'):
+    lines = [f'- curl_test_https_{proto} ipv4 {target} : nfqws2 {strategy}']
     for n in range(1, attempts + 1):
         lines.append(f'[attempt {n}] ' + ('curl: (28) timeout' if n == fail else 'AVAILABLE'))
     lines.append('UNAVAILABLE code=28' if fail else '!!!!! AVAILABLE !!!!!')
@@ -18,77 +20,68 @@ def block(strategy, target='www.youtube.com', attempts=5, fail=None):
 
 
 class SelectionTests(unittest.TestCase):
-    def run_rank(self, log, candidates='safe\n', targets='www.youtube.com\n', repeats=5):
+    def rank(self, log, candidates=A+'\n', targets='www.youtube.com\n', discover=0):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d)
             for name, body in [('log', log), ('candidates', candidates), ('targets', targets)]:
-                (p / name).write_text(body, encoding='utf-8')
-            return subprocess.run(['awk', '-v', f'targets={(p / "targets").as_posix()}', '-v', f'repeats={repeats}',
-                                   '-v', 'protocol=curl_test_https_tls13', '-f', str(ROOT / 'src/select.awk'),
-                                   str(p / 'candidates'), str(p / 'log')], text=True, capture_output=True)
+                (p/name).write_text(body, encoding='utf-8')
+            return subprocess.run(['awk', '-v', f'targets={(p/"targets").as_posix()}',
+                '-v', 'repeats=3', '-v', 'protocol=curl_test_https_tls13', '-v', f'discover={discover}',
+                '-f', (ROOT/'src/select.awk').as_posix(), (p/'candidates').as_posix(),
+                (p/'log').as_posix()], text=True, capture_output=True)
 
-    def test_accepts_all_repeats(self):
-        r = self.run_rank(block('safe'))
-        self.assertEqual((r.returncode, r.stdout.strip()), (0, 'safe'))
+    def test_all_three_alternatives_in_native_order(self):
+        r = self.rank(block(A)+block(B)+block(C), A+'\n'+B+'\n'+C+'\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines(), [A, B, C])
 
-    def test_rejects_one_failed_attempt_even_if_four_pass(self):
-        self.assertEqual(self.run_rank(block('safe', fail=2)).returncode, 2)
+    def test_discovery_works_with_empty_allowlist(self):
+        r = self.rank(block(B), candidates='', discover=1)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, B))
 
-    def test_rejects_incomplete_run(self):
-        self.assertEqual(self.run_rank(block('safe', attempts=4)).returncode, 2)
+    def test_rejects_one_failed_attempt(self):
+        self.assertEqual(self.rank(block(A, fail=2)).returncode, 2)
 
-    def test_rejects_log_injection_unknown_candidate(self):
-        self.assertEqual(self.run_rank(block('safe; touch /tmp/injection')).returncode, 2)
+    def test_rejects_incomplete_or_duplicated_blocks(self):
+        for log in [block(A, attempts=2), block(A, fail=2)+block(A), block(A)+block(A)]:
+            self.assertEqual(self.rank(log).returncode, 2)
 
-    def test_requires_every_target(self):
-        self.assertEqual(self.run_rank(block('safe'), targets='www.youtube.com\ni.ytimg.com\n').returncode, 2)
+    def test_requires_every_target_and_same_strategy(self):
+        targets='www.youtube.com\ni.ytimg.com\n'
+        self.assertEqual(self.rank(block(A), targets=targets).returncode, 2)
+        self.assertEqual(self.rank(block(A)+block(B, 'i.ytimg.com'), A+'\n'+B+'\n', targets).returncode, 2)
+        self.assertEqual(self.rank(block(A)+block(A, 'i.ytimg.com'), targets=targets).returncode, 0)
 
-    def test_no_union_of_different_strategies(self):
-        r = self.run_rank(block('one') + block('two', 'i.ytimg.com'), 'one\ntwo\n', 'www.youtube.com\ni.ytimg.com\n')
-        self.assertEqual(r.returncode, 2)
+    def test_rejects_injection_and_process_control_options(self):
+        for args in [A+'; touch /tmp/injection', A+' $(id)', A+' `id`', A+' --lua-init=evil',
+                     A+' --new', A+' --hostlist=/tmp/other', A+"'", A+' --qnum=1']:
+            self.assertEqual(self.rank(block(args), candidates='', discover=1).returncode, 2, args)
 
-    def test_rejects_duplicated_trial_blocks(self):
-        self.assertEqual(self.run_rank(block('safe', fail=2) + block('safe')).returncode, 2)
+    def test_baseline_summary_and_other_protocol_do_not_count(self):
+        for log in ['- checking without DPI bypass\n[attempt 1] AVAILABLE\n!!!!! AVAILABLE !!!!!\n',
+                    f'curl_test_https_tls13 ipv4 www.youtube.com : nfqws2 {A}\n!!!!! AVAILABLE !!!!!\n',
+                    block(A, proto='tls12')]:
+            self.assertEqual(self.rank(log).returncode, 2)
 
-    def test_prefers_no_fake_when_both_reliable(self):
-        simple = '--lua-desync=multidisorder:pos=1,midsld'
-        fake = '--lua-desync=fake:blob=x --lua-desync=multidisorder:pos=1,midsld'
-        r = self.run_rank(block(fake) + block(simple), simple + '\n' + fake + '\n')
-        self.assertEqual(r.stdout.strip(), simple)
+    def test_empty_first_tls_intersection_is_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)
+            (p/'empty').write_text('')
+            (p/'ok').write_text(A+'\n')
+            r=subprocess.run(['awk', 'FILENAME==ARGV[1] {ok[$0]=1; next} $0 in ok',
+                (p/'empty').as_posix(), (p/'ok').as_posix()], capture_output=True, text=True)
+            self.assertEqual(r.stdout, '')
 
 
-class BuildAndShellTests(unittest.TestCase):
-    def test_build_is_reproducible(self):
-        before = (ROOT / 'install.sh').read_bytes()
-        subprocess.run([sys.executable, str(ROOT / 'scripts/build.py')], check=True, capture_output=True)
-        self.assertEqual(before, (ROOT / 'install.sh').read_bytes())
-
-    def test_shell_syntax_and_help(self):
-        subprocess.run(['sh', '-n', str(ROOT / 'install.sh')], check=True)
-        result = subprocess.run(['sh', str(ROOT / 'install.sh'), '--help'], text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0)
-        self.assertIn('--rollback', result.stdout)
-
-    def test_list_expansion_preserves_other_services(self):
-        env = dict(os.environ, YTA_LIBRARY_ONLY='1')
-        command = '. "$1"; expanded_lists russia_inside meta telegram custom youtube'
-        r = subprocess.run(['sh', '-c', command, 'test', str(ROOT / 'install.sh')], env=env, text=True, capture_output=True, check=True)
-        items = r.stdout.split()
-        self.assertNotIn('youtube', items)
-        self.assertNotIn('russia_inside', items)
-        self.assertEqual(items.count('meta'), 1)
-        self.assertIn('telegram', items)
-        self.assertIn('custom', items)
-
-    def test_candidates_are_unique_and_no_shell_metacharacters(self):
-        for path in (ROOT / 'data').glob('*candidates*.txt'):
-            self.assertTrue(path.is_file())
-        for name in ['tcp.txt', 'quic.txt']:
-            lines = (ROOT / 'data' / name).read_text().splitlines()
-            self.assertEqual(len(lines), len(set(lines)))
-            for line in lines:
-                for forbidden in [';', '$', '`', '|', '>', '<', '\\']:
-                    self.assertNotIn(forbidden, line)
+class BuildTests(unittest.TestCase):
+    def test_build_and_posix_shell(self):
+        before=(ROOT/'install.sh').read_bytes()
+        subprocess.run([sys.executable, str(ROOT/'scripts/build.py')], check=True, capture_output=True)
+        self.assertEqual(before, (ROOT/'install.sh').read_bytes())
+        subprocess.run(['sh','-n', str(ROOT/'install.sh')], check=True)
+        r=subprocess.run(['sh', str(ROOT/'install.sh'), '--help'], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('--rollback', r.stdout)
 
 
 if __name__ == '__main__':
