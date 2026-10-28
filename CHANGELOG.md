@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.0.1 — 2026-10-28
+
+- Fixed the real-device startup failure on OpenWrt without standalone `od`: ARM/ARM64 and other explicit architecture names no longer require it. Only ambiguous MIPS names read ELF byte order, with a BusyBox applet fallback; unknown byte order still fails safely.
+- Added focused regression tests. No scanner, firewall, strategy or Failover behavior changed.
+
 ## 4.0.0 — 2026-10-28
 
 - BlockcheckW-only search/check pipeline; Blockcheck2 removed entirely at the user's explicit request. Incompatibility fails fast instead of falling back to a slow engine.

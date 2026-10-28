@@ -1,7 +1,7 @@
 #!/bin/sh
 # MIT. BlockcheckW-only search; does not replace the installed zapret2.
 set -eu
-VERSION=4.0.0
+VERSION=4.0.1
 BASE=/opt/zapret2
 OWN=/etc/zapret2-youtube-autotune
 LOCK=/var/lock/zapret2-youtube-autotune.lock
@@ -66,7 +66,7 @@ preflight() {
     case "$DISTRIB_RELEASE" in 24.10*|25.12*) ;; *) die 'Поддерживаются OpenWrt 24.10/25.12.';; esac
     available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
     [ "${available_kb:-0}" -ge 24576 ] || die 'Для подбора недостаточно RAM (нужно 24 МБ MemAvailable для применения кэша; 64 МБ для поиска).'
-    for cmd in uci curl awk sed sort cmp sha256sum setsid nft ubus jsonfilter tar ip od cut head; do
+    for cmd in uci curl awk sed sort cmp sha256sum setsid nft ubus jsonfilter tar ip cut head; do
         command -v "$cmd" >/dev/null || die "Нет $cmd. Установите недостающую зависимость вручную (opkg на 24 / apk на 25)."
     done
     case "$BASE" in /*) ;; *) die 'Нужен абсолютный --base.';; esac
@@ -769,6 +769,17 @@ bcw_arch() {
         riscv64*) echo riscv64;; ppc*|powerpc*) echo ppc;; *) return 1;;
     esac
 }
+bcw_detect_arch() {
+    arch=${DISTRIB_ARCH:-$(uname -m)}
+    # ARM/x86 and explicit MIPSEL names need no ELF reader at all.
+    if bcw_arch "$arch" ''; then return 0; fi
+    case "$arch" in mips64el*) return 1;; mips*) ;; *) return 1;; esac
+    # OpenWrt may provide the applet without a standalone od symlink.
+    byte=$(od -An -tu1 -j5 -N1 /bin/busybox 2>/dev/null) ||
+      byte=$(busybox od -An -tu1 -j5 -N1 /bin/busybox 2>/dev/null) || return 1
+    byte=$(printf '%s' "$byte" | tr -d ' \n\r\t')
+    bcw_arch "$arch" "$byte"
+}
 bcw_sha() {
     case "$1" in
         arm) echo ad61c9efe034c02a6d5956379cf3ae093aec9c6093f087f8f75f81c3aa56b96c;;
@@ -806,7 +817,7 @@ bcw_binary_ok() {
     done
 }
 bcw_install() {
-    BCW_ARCH=$(bcw_arch "${DISTRIB_ARCH:-$(uname -m)}" "$(od -An -tu1 -j5 -N1 /bin/busybox 2>/dev/null | tr -d ' ')" ) || die 'Нет совместимой архитектуры BlockcheckW. Медленный резервный движок отключён.'
+    BCW_ARCH=$(bcw_detect_arch) || die 'Не удалось определить совместимую архитектуру BlockcheckW (для неоднозначного MIPS нужен od или busybox od).'
     candidate=$(command -v blockcheckw 2>/dev/null || true)
     if [ -n "$candidate" ] && bcw_binary_ok "$candidate"; then BCW_BIN=$candidate; return; fi
     if [ -e "$BCW_TOOLS" ]; then

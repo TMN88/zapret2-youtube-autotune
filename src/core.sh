@@ -1,7 +1,7 @@
 #!/bin/sh
 # MIT. BlockcheckW-only search; does not replace the installed zapret2.
 set -eu
-VERSION=4.0.0
+VERSION=4.0.1
 BASE=/opt/zapret2
 OWN=/etc/zapret2-youtube-autotune
 LOCK=/var/lock/zapret2-youtube-autotune.lock
@@ -66,7 +66,7 @@ preflight() {
     case "$DISTRIB_RELEASE" in 24.10*|25.12*) ;; *) die 'Поддерживаются OpenWrt 24.10/25.12.';; esac
     available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
     [ "${available_kb:-0}" -ge 24576 ] || die 'Для подбора недостаточно RAM (нужно 24 МБ MemAvailable для применения кэша; 64 МБ для поиска).'
-    for cmd in uci curl awk sed sort cmp sha256sum setsid nft ubus jsonfilter tar ip od cut head; do
+    for cmd in uci curl awk sed sort cmp sha256sum setsid nft ubus jsonfilter tar ip cut head; do
         command -v "$cmd" >/dev/null || die "Нет $cmd. Установите недостающую зависимость вручную (opkg на 24 / apk на 25)."
     done
     case "$BASE" in /*) ;; *) die 'Нужен абсолютный --base.';; esac

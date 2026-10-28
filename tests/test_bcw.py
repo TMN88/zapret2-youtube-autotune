@@ -85,6 +85,24 @@ class AdapterTests(unittest.TestCase):
         self.assertNotEqual(self.shell('bcw_arch mips64el 1').returncode,0)
         self.assertNotEqual(self.shell('bcw_arch unknown 0').returncode,0)
 
+    def test_arch_detection_without_standalone_od(self):
+        for arch,expected in [('aarch64_cortex-a53','arm64'),('mipsel_24kc','mipsel'),
+                              ('x86_64','x86_64')]:
+            r=self.shell(f'DISTRIB_ARCH={arch}; od() {{ exit 97; }}; '
+                'busybox() { exit 98; }; bcw_detect_arch')
+            self.assertEqual((r.returncode,r.stdout.strip()),(0,expected),r.stderr)
+        core=(ROOT/'src/core.sh').read_text(encoding='utf-8')
+        self.assertNotIn(' ip od cut ',core)
+
+    def test_ambiguous_mips_uses_busybox_applet_or_fails_closed(self):
+        for byte,expected in [('1','mipsel'),('2','mips')]:
+            r=self.shell('DISTRIB_ARCH=mips_24kc; od() { return 127; }; '
+                f'busybox() {{ echo "  {byte}"; }}; bcw_detect_arch')
+            self.assertEqual((r.returncode,r.stdout.strip()),(0,expected),r.stderr)
+        r=self.shell('DISTRIB_ARCH=mips_24kc; od() { return 127; }; '
+            'busybox() { return 127; }; bcw_detect_arch')
+        self.assertNotEqual(r.returncode,0)
+
     def test_adaptive_workers_and_memory_floor(self):
         for ram,workers,profiles in [(65536,8,16),(100000,16,64),(200000,32,128)]:
             r=self.shell(f'bcw_resources {ram}; echo "$BCW_WORKERS $BCW_PROFILES"')
