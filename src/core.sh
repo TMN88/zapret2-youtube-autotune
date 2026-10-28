@@ -1,7 +1,7 @@
 #!/bin/sh
 # MIT. BlockcheckW-only search; does not replace the installed zapret2.
 set -eu
-VERSION=4.0.2
+VERSION=4.0.3
 BASE=/opt/zapret2
 OWN=/etc/zapret2-youtube-autotune
 LOCK=/var/lock/zapret2-youtube-autotune.lock
@@ -47,6 +47,7 @@ sh install.sh [--want 2|3] [--base /opt/zapret2] [--wan-network wan]
   --media-url-file FILE   Optional fresh HTTPS googlevideo media URL from this WAN.
   --check                Read-only prerequisites, no network tests.
   --refresh              Ignore the 24-hour WAN/engine-scoped result cache.
+  --resume-scan BACKUP    Recheck saved scan candidates without repeating discovery.
   --no-quic              Skip direct QUIC and revalidation of an existing QUIC profile.
   --no-failover          Do not enable the local failover service.
   --status               Show the installed monitor status and active TCP strategy.
@@ -440,10 +441,10 @@ main() {
             --help|-h) help; return;; --version) say "$VERSION"; return;; --check) MODE=check;;
             --no-quic) QUIC_MODE=off;; --refresh) REFRESH=1;; --no-failover) MONITOR=0;;
             --monitor-loop|--failover-once|--status) runtime_main "$1"; return;;
-            --base|--wan-network|--want|--scan-seconds|--media-url-file|--workers)
+            --base|--wan-network|--want|--scan-seconds|--media-url-file|--workers|--resume-scan)
                 [ "$#" -ge 2 ] || die "Нет значения $1"
                 opt=$1; shift
-                case "$opt" in --base) BASE=$1;; --wan-network) WAN_NETWORK=$1;; --want) WANT=$1;; --scan-seconds) TIME_LIMIT=$1;; --media-url-file) MEDIA_FILE=$1;; --workers) WORKERS_LIMIT=$1;; esac;;
+                case "$opt" in --base) BASE=$1;; --wan-network) WAN_NETWORK=$1;; --want) WANT=$1;; --scan-seconds) TIME_LIMIT=$1;; --media-url-file) MEDIA_FILE=$1;; --workers) WORKERS_LIMIT=$1;; --resume-scan) RESUME_SCAN=$1; REFRESH=1;; esac;;
             --rollback)
                 [ "$#" = 2 ] || die 'Нужны только --rollback и backup.'
                 resolved=$(readlink -f "$2")

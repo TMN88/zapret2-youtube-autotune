@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.0.3 — 2026-10-28
+
+- Retain scan reports saved during graceful deadline termination instead of discarding candidates. Timed-out strict checks are still rejected.
+- Account for upstream v0.12.1 SIGTERM report provenance using a separate candidate-only import mode; existing strict check validation is unchanged.
+- Added --resume-scan BACKUP to reuse interrupted discovery candidates with matching original configuration; all selected candidates receive fresh strict checks and service validation. Invalid import fails without a new scan.
+
 ## 4.0.2 — 2026-10-28
 
 - Added a low-memory policy for 48–64 MiB MemAvailable: two workers, four profiles, one-second polling and a 32 MiB reserve. Below 48 MiB new scanning is refused. Higher-memory policy is unchanged.

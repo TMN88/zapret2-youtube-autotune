@@ -16,6 +16,7 @@ STARTED=0
 SCAN_DEADLINE=0
 FAST_SECONDS=90
 WORKERS_LIMIT=32
+RESUME_SCAN=
 
 phase_start() { PHASE=$1; PHASE_AT=$(date +%s); printf '\033[1;96m%s\033[0m\n' "$PHASE"; }
 phase_end() { printf '\033[1;96m%s: %s с\033[0m\n' "$PHASE" "$(($(date +%s)-PHASE_AT))"; }
@@ -195,8 +196,11 @@ bcw_run() {
     job_end=$(($(date +%s)+job_seconds+10))
     [ "$job_end" -le "$SCAN_DEADLINE" ] || job_end=$SCAN_DEADLINE
     job_polls=0
+    job_timed_out=0
     while kill -0 "$SCAN_PID" 2>/dev/null; do
-        if [ "$(date +%s)" -ge "$job_end" ]; then stop_scan; return 1; fi
+        if [ "$(date +%s)" -ge "$job_end" ]; then
+            stop_scan; job_timed_out=1; break
+        fi
         if ! bcw_memory_at_least "$BCW_RESERVE_KB"; then
             stop_scan; die "Подбор остановлен: MemAvailable ${current_kb:-неизвестно} КБ ниже резерва $BCW_RESERVE_KB КБ. Другие службы не тронуты."
         fi
@@ -204,15 +208,52 @@ bcw_run() {
         job_polls=$((job_polls+1))
         if [ "$((job_polls*BCW_POLL_SECONDS % 10))" = 0 ]; then say "$job_label: работа продолжается, общий остаток $(bcw_remaining) с"; fi
     done
-    job_rc=0; wait "$SCAN_PID" || job_rc=$?
-    stop_scan
-    [ "$job_rc" = 0 ] || return 1
+    job_rc=0
+    if [ "$job_timed_out" = 0 ]; then
+        wait "$SCAN_PID" || job_rc=$?
+        stop_scan
+    fi
+    bcw_collect_report
+}
+bcw_collect_report() {
+    JOB_READ_MODE=scan
+    # A timed-out scan may save valid candidates on SIGTERM. Never admit a
+    # timed-out check: it must complete all strict passes successfully.
+    if [ "$job_timed_out" = 1 ]; then
+        [ "$job_kind" = scan ] || return 1
+        JOB_READ_MODE=seed
+        say 'Лимит поиска достигнут; читаем сохранённых кандидатов для полной проверки.'
+    else [ "$job_rc" = 0 ] || return 1; fi
     if [ "$job_kind" = scan ]; then
         JOB_REPORT=
         for f in "$job_dir/"*_scan.json; do [ ! -f "$f" ] || JOB_REPORT=$f; done
         [ -n "$JOB_REPORT" ] || return 1
     else JOB_REPORT="$job_dir/report.json"; fi
     [ -s "$JOB_REPORT" ]
+}
+bcw_resume() {
+    source_backup=$(readlink -f "$RESUME_SCAN") || return 1
+    case "$source_backup" in /root/zapret2-youtube-backup-*) ;; *) return 1;; esac
+    source_pid=${source_backup##*-}
+    case "$source_pid" in ''|*[!0-9]*) return 1;; esac
+    [ -f "$source_backup/original-config" ] && cmp -s "$source_backup/original-config" "$CONFIG" || return 1
+    source_report=
+    for f in "$source_backup/scan/"*_scan.json; do
+        [ -f "$f" ] || continue
+        [ -z "$source_report" ] || return 1
+        source_report=$f
+    done
+    [ -n "$source_report" ] || return 1
+    # Import candidates, never old pass/fail evidence; every selected strategy
+    # will undergo fresh causal/full-body checks and real-service validation.
+    source_workers=1; source_profiles=1
+    jq -er --arg mode seed --arg domain www.youtube.com \
+      --arg table "yta_bcw_${source_pid}_scan" --argjson pid "$source_pid" \
+      --argjson qnum "$((52000+(source_pid % 1000)*10))" \
+      --argjson workers "$source_workers" --argjson profiles "$source_profiles" \
+      -f "$RUN/bcw-report.jq" "$source_report" > "$RUN/discovered.tsv" || return 1
+    cp "$source_report" "$BACKUP/resumed-scan.json"
+    say "Кандидаты из $source_backup; повторное сканирование пропущено, проверки выполняются заново."
 }
 bcw_read() {
     # Validate report provenance before reading any candidate args.
@@ -251,8 +292,12 @@ choose() {
     fi
     bcw_prepare
     SCAN_DEADLINE=$(($(date +%s)+TIME_LIMIT))
-    bcw_run scan scan '' www.youtube.com / 0 || die 'BlockcheckW не завершил быстрый поиск. См. backup; медленного резервного пути нет.'
-    bcw_read scan www.youtube.com > "$RUN/discovered.tsv" || die 'BlockcheckW: нет доказанного поиска (доступно напрямую, ошибка или недопустимый JSON).'
+    if [ -n "$RESUME_SCAN" ]; then
+        bcw_resume || die 'Не удалось принять сохранённый отчёт: путь, конфигурация или JSON не прошли проверку. Новый поиск не запускается.'
+    else
+        bcw_run scan scan '' www.youtube.com / 0 || die 'BlockcheckW не сохранил результат быстрого поиска. См. scan/progress.log в backup; медленного резервного пути нет.'
+        bcw_read "${JOB_READ_MODE:-scan}" www.youtube.com > "$RUN/discovered.tsv" || die 'BlockcheckW: нет кандидатов в допустимом JSON (доступно напрямую, ошибка или недопустимый JSON).'
+    fi
     cut -f2 "$RUN/discovered.tsv" | awk '!seen[$0]++' | awk -f "$RUN/safe.awk" > "$RUN/pool"
     CANDIDATES=$(wc -l < "$RUN/pool")
     say "Найдено безопасных разных кандидатов: $CANDIDATES"

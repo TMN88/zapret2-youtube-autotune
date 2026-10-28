@@ -1,6 +1,14 @@
 # JSON contract of BlockcheckW 0.12.1 (schema 1), not its human-readable output.
 def fail($s): error($s);
 if .schema != 1 or .domain != $domain then fail("schema/domain mismatch") else . end |
+if $mode=="seed" then
+  # Upstream SIGTERM reports use default CoreConfig/dns provenance. These
+  # are inert candidate strings only; never reuse them as checked evidence.
+  if .outcome!="found" or .stopped_at!="deadline" or
+     .run.embedded!=true or .run.bcw_version!="0.12.1" or
+     (.blocked|type)!="array" or (.blocked|index("HTTPS/TLS1.3"))==null
+  then fail("invalid interrupted candidate report") else . end
+else
 if (.run.embedded != true or .run.dns != "doh" or .run.qnum != $qnum or
     .run.nft_table != $table or .run.process_group != $pid or
     .run.mark_base != "0x20000000" or .run.desync_mark != "0x10000000" or
@@ -11,12 +19,13 @@ then fail("resource profile mismatch") else . end |
 if .outcome=="broken" or .outcome=="censored" or .outcome=="nothing_works" then fail("no completed evidence") else . end |
 if $mode!="scan" and ((.control|type)!="object" or (.inconclusive|type)!="boolean") then fail("missing control evidence") else . end |
 if $mode!="auxiliary" and (.outcome!="found" or .inconclusive==true) then fail("control passed or no evidence") else . end |
-if $mode=="auxiliary" and (.outcome!="found" and .outcome!="not_blocked") then fail("invalid outcome") else . end |
+if $mode=="auxiliary" and (.outcome!="found" and .outcome!="not_blocked") then fail("invalid outcome") else . end
+end |
 if (.strategies|type)!="array" then fail("missing strategies") else . end |
 .strategies[] |
 select(.protocol=="HTTPS/TLS1.2" or .protocol=="HTTPS/TLS1.3") |
 select((.args|type)=="string" and (.args|test("^[A-Za-z0-9_.,:+=/@ -]+$"))) |
-select($mode=="scan" or
+select($mode=="scan" or $mode=="seed" or
        (.working==true and .passes_ok==3 and .passes_total==3 and .observed=="Bytes" and
         (.admits|type)=="array" and (.admits|length)>0 and .admits!=["Mirage"])) |
 [.protocol,.args] | @tsv

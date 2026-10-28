@@ -74,6 +74,22 @@ class JsonTests(unittest.TestCase):
         self.assertNotEqual(self.parse(d).returncode,0)
 
 
+    def test_interrupted_report_is_candidates_only(self):
+        d=report('scan');d.update(stopped_at='deadline',blocked=['HTTPS/TLS1.3'])
+        d['run'].update(dns='—',qnum=200,nft_table='blockcheckw',workers=1024)
+        d['strategies'][0]={'protocol':'HTTPS/TLS1.3','args':A,'coverage':1}
+        self.assertEqual(self.parse(d,mode='seed').returncode,0)
+        for mode in ['scan','causal','auxiliary']:
+            self.assertNotEqual(self.parse(d,mode=mode).returncode,0)
+        for key,value in [('outcome','censored'),('domain','example.org'),('stopped_at','take')]:
+            bad=copy.deepcopy(d);bad[key]=value
+            self.assertNotEqual(self.parse(bad,mode='seed').returncode,0)
+        bad=copy.deepcopy(d);bad['run']['embedded']=False
+        self.assertNotEqual(self.parse(bad,mode='seed').returncode,0)
+        bad=copy.deepcopy(d);bad['strategies'][0]['args']='--lua-desync=luaexec;touch /tmp/evil'
+        self.assertNotEqual(self.parse(bad,mode='seed').returncode,0)
+
+
 class AdapterTests(unittest.TestCase):
     shell=support.TransactionTests.shell
 
@@ -214,6 +230,43 @@ class AdapterTests(unittest.TestCase):
     def test_deadline_never_creates_negative_remaining(self):
         r=self.shell('date() { echo 200; }; SCAN_DEADLINE=100; bcw_remaining')
         self.assertEqual(r.stdout.strip(),'0')
+
+    def test_interrupted_scan_retained_and_timed_out_check_rejected(self):
+        for kind,exists,timeout,rc,expected in [('scan',True,1,143,0),('scan',False,1,143,1),
+                ('check',True,1,143,1),('scan',True,0,1,1),('scan',True,0,0,0)]:
+            with self.subTest(kind=kind,exists=exists,timeout=timeout,rc=rc),tempfile.TemporaryDirectory() as d:
+                p=Path(d)
+                if exists:
+                    (p/'saved_scan.json').write_text('{}')
+                    (p/'report.json').write_text('{}')
+                r=self.shell(f'job_dir="{p.as_posix()}"; job_kind={kind}; '
+                    f'job_timed_out={timeout}; job_rc={rc}; bcw_collect_report; echo "$JOB_READ_MODE"')
+                self.assertEqual(r.returncode,expected,r.stderr)
+                if expected==0: self.assertTrue(r.stdout.strip().endswith('seed' if timeout else 'scan'))
+
+    def test_resume_saved_candidates_and_reject_config_or_domain_mismatch(self):
+        for case in ['valid','config','domain']:
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as d:
+                p=Path(d);old=p/'zapret2-youtube-backup-test-42';(old/'scan').mkdir(parents=True)
+                (old/'original-config').write_text('original')
+                (p/'config').write_text('changed' if case=='config' else 'original')
+                run=p/'run';run.mkdir();backup=p/'backup';backup.mkdir()
+                data=report('scan');data.update(stopped_at='deadline',blocked=['HTTPS/TLS1.3'])
+                data['run'].update(dns='—',qnum=200,nft_table='blockcheckw')
+                if case=='domain':data['domain']='example.org'
+                (old/'scan/old_scan.json').write_text(json.dumps(data))
+                # Redirect only the allowed backup prefix into this private test
+                # directory; execute the production import function unchanged otherwise.
+                src=(ROOT/'src/bcw.sh').read_text(encoding='utf-8')
+                fn='bcw_resume() {'+src.split('bcw_resume() {',1)[1].split('\n}',1)[0]+'\n}'
+                fn=fn.replace('/root/zapret2-youtube-backup-',p.as_posix()+'/zapret2-youtube-backup-')
+                r=self.shell(fn+f'; RUN="{run.as_posix()}"; BACKUP="{backup.as_posix()}"; '
+                    f'RESUME_SCAN="{old.as_posix()}"; CONFIG="{p.as_posix()}/config"; write_assets; bcw_resume')
+                self.assertEqual(r.returncode,0 if case=='valid' else 1,r.stderr)
+                if case=='valid':
+                    self.assertIn(A,(run/'discovered.tsv').read_text())
+                    self.assertTrue((backup/'resumed-scan.json').exists())
+                    self.assertFalse((run/'selected').exists())
 
     def test_real_choose_pipeline_groups_checks_and_rejects_bad_evidence(self):
         for scenario,expected in [('three',3),('two',2),('partial',0),('baseline',0)]:
