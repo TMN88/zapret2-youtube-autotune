@@ -1,7 +1,7 @@
 #!/bin/sh
 # MIT. BlockcheckW-only search; does not replace the installed zapret2.
 set -eu
-VERSION=4.0.3
+VERSION=4.0.4
 BASE=/opt/zapret2
 OWN=/etc/zapret2-youtube-autotune
 LOCK=/var/lock/zapret2-youtube-autotune.lock

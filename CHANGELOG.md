@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.0.4 — 2026-10-28
+
+- Separate memory policy for --resume-scan: strict checks use one worker/profile, 44 MiB minimum before launch, a 32 MiB reserve and one-second polling. New parallel discovery still requires 48 MiB or more.
+- Refuse any discovery invocation when running with the check-only resume budget. Thresholds are workload limits, not measured hardware memory-safety guarantees.
+
 ## 4.0.3 — 2026-10-28
 
 - Retain scan reports saved during graceful deadline termination instead of discarding candidates. Timed-out strict checks are still rejected.

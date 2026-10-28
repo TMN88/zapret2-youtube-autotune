@@ -1,7 +1,7 @@
 #!/bin/sh
 # MIT. BlockcheckW-only search; does not replace the installed zapret2.
 set -eu
-VERSION=4.0.3
+VERSION=4.0.4
 BASE=/opt/zapret2
 OWN=/etc/zapret2-youtube-autotune
 LOCK=/var/lock/zapret2-youtube-autotune.lock
@@ -801,6 +801,13 @@ bcw_sha() {
 }
 bcw_resources() {
     case "$1" in ''|*[!0-9]*) return 1;; esac
+    if [ "${2:-scan}" = check ]; then
+        # --resume-scan runs strict checks only. Upstream check uses one
+        # worker/profile; do not require memory for a parallel discovery pool.
+        BCW_WORKERS=1; BCW_PROFILES=1
+        BCW_START_KB=45056; BCW_RESERVE_KB=32768; BCW_POLL_SECONDS=1
+        [ "$1" -ge "$BCW_START_KB" ]; return
+    fi
     BCW_START_KB=65536; BCW_RESERVE_KB=24576; BCW_POLL_SECONDS=2
     if [ "$1" -lt 49152 ]; then return 1
     elif [ "$1" -lt 65536 ]; then
@@ -870,9 +877,13 @@ bcw_prepare() {
     command -v jq >/dev/null || die 'Нужен небольшой пакет jq для строгой проверки JSON. Установите его через opkg/apk; тяжёлые зависимости не требуются.'
     [ "$BASE" = /opt/zapret2 ] || die 'Текущий BlockcheckW поддерживает только /opt/zapret2. Путь zapret2 не изменялся.'
     available_kb=$(bcw_memory_available)
-    bcw_resources "$available_kb" || die "Для облегчённого поиска нужно минимум 48 МБ MemAvailable; сейчас ${available_kb:-неизвестно} КБ. Другие службы не останавливаются."
+    resource_mode=scan; resource_min=48
+    if [ -n "$RESUME_SCAN" ]; then resource_mode=check; resource_min=44; fi
+    bcw_resources "$available_kb" "$resource_mode" || die "Для режима $resource_mode нужно минимум $resource_min МБ MemAvailable; сейчас ${available_kb:-неизвестно} КБ. Другие службы не останавливаются."
     printf '\033[1;96mMemAvailable: %s КБ | Минимум перед пробой: %s КБ | Резерв при работе: %s КБ\033[0m\n' "$available_kb" "$BCW_START_KB" "$BCW_RESERVE_KB"
-    if [ "$BCW_START_KB" = 49152 ]; then
+    if [ "$resource_mode" = check ]; then
+        printf '\033[1;96mПродолжение: только контрольные проверки, 1 воркер и 1 профиль; поиск пропущен. Контроль RAM каждую секунду.\033[0m\n'
+    elif [ "$BCW_START_KB" = 49152 ]; then
         printf '\033[1;93mОблегчённый режим: 2 воркера, 4 профиля; контроль RAM каждую секунду. Расход памяти на этой модели ещё не измерен.\033[0m\n'
     fi
     cpu_count=$(awk '/^processor[[:space:]]*:/ {n++} END {print n+0}' /proc/cpuinfo)
@@ -909,6 +920,8 @@ bcw_remaining() { left=$((SCAN_DEADLINE-$(date +%s))); [ "$left" -gt 0 ] || left
 bcw_run() {
     # $1 label, $2 scan|check, $3 input for check, $4 domain, $5 path, $6 take.
     job_label=$1; job_kind=$2; job_input=$3; job_domain=$4; job_path=$5; job_take=$6
+    # Never launch discovery with the smaller check-only memory budget.
+    if [ -n "$RESUME_SCAN" ] && [ "$job_kind" = scan ]; then return 1; fi
     job_left=$(bcw_remaining)
     [ "$job_left" -ge 5 ] || return 1
     # Recheck after download/extraction and before every new scanner process.

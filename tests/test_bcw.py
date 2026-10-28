@@ -139,6 +139,20 @@ class AdapterTests(unittest.TestCase):
         r=self.shell('WORKERS_LIMIT=1; bcw_resources 52540; echo "$BCW_WORKERS $BCW_PROFILES"')
         self.assertEqual(r.stdout.strip(),'1 4')
 
+    def test_resume_memory_policy_is_check_only(self):
+        for available in [45056,49096,65536,200000]:
+            r=self.shell(f'bcw_resources {available} check; '
+                'echo "$BCW_WORKERS $BCW_PROFILES $BCW_START_KB $BCW_RESERVE_KB $BCW_POLL_SECONDS"')
+            self.assertEqual((r.returncode,r.stdout.strip()),(0,'1 1 45056 32768 1'))
+        for available in ['45055','bad','']:
+            self.assertNotEqual(self.shell(f"bcw_resources '{available}' check").returncode,0)
+        self.assertNotEqual(self.shell('bcw_resources 49096 scan').returncode,0)
+        r=self.shell('RESUME_SCAN=saved; bcw_resources 49096 check; '
+            'bcw_remaining() { echo forbidden; exit 97; }; '
+            'bcw_run scan scan unused www.youtube.com / 0')
+        self.assertEqual(r.returncode,1)
+        self.assertNotIn('forbidden',r.stdout)
+
     def test_low_memory_stops_before_launch_and_cleans_running_job(self):
         r=self.shell('bcw_resources 52540; bcw_remaining() { echo 60; }; '
             'bcw_memory_available() { echo 48000; }; mkdir() { echo forbidden; exit 97; }; '
