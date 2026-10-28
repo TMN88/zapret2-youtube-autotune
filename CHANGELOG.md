@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.0.2 — 2026-10-28
+
+- Added a low-memory policy for 48–64 MiB MemAvailable: two workers, four profiles, one-second polling and a 32 MiB reserve. Below 48 MiB new scanning is refused. Higher-memory policy is unchanged.
+- Recheck available memory before every scanner process, including after binary installation; report actual RAM and thresholds. Unknown readings fail closed. No services are stopped to free RAM; no hardware memory-safety claim is made.
+- Added boundary, malformed-reading, pre-launch rejection and running-job cleanup regression tests.
+
 ## 4.0.1 — 2026-10-28
 
 - Fixed the real-device startup failure on OpenWrt without standalone `od`: ARM/ARM64 and other explicit architecture names no longer require it. Only ambiguous MIPS names read ELF byte order, with a BusyBox applet fallback; unknown byte order still fails safely.

@@ -4,6 +4,9 @@ BCW_BIN=
 BCW_TOOLS=/usr/libexec/youtube-autotune
 BCW_WORKERS=0
 BCW_PROFILES=0
+BCW_START_KB=65536
+BCW_RESERVE_KB=24576
+BCW_POLL_SECONDS=2
 BCW_TABLE=
 BCW_QNUM=
 SCAN_TABLE=
@@ -51,11 +54,21 @@ bcw_sha() {
 }
 bcw_resources() {
     case "$1" in ''|*[!0-9]*) return 1;; esac
-    if [ "$1" -lt 65536 ]; then return 1
+    BCW_START_KB=65536; BCW_RESERVE_KB=24576; BCW_POLL_SECONDS=2
+    if [ "$1" -lt 49152 ]; then return 1
+    elif [ "$1" -lt 65536 ]; then
+        BCW_WORKERS=2; BCW_PROFILES=4
+        BCW_START_KB=49152; BCW_RESERVE_KB=32768; BCW_POLL_SECONDS=1
     elif [ "$1" -lt 98304 ]; then BCW_WORKERS=8; BCW_PROFILES=16
     elif [ "$1" -lt 163840 ]; then BCW_WORKERS=16; BCW_PROFILES=64
     else BCW_WORKERS=32; BCW_PROFILES=128; fi
     [ "$BCW_WORKERS" -le "$WORKERS_LIMIT" ] || BCW_WORKERS=$WORKERS_LIMIT
+}
+bcw_memory_available() { awk '/^MemAvailable:/ {print $2}' /proc/meminfo; }
+bcw_memory_at_least() {
+    current_kb=$(bcw_memory_available)
+    case "$current_kb" in ''|*[!0-9]*) return 1;; esac
+    [ "$current_kb" -ge "$1" ]
 }
 bcw_capability() {
     "$BASE/nfq2/nfqws2" --help > "$RUN/nfq-help" 2>&1 || true
@@ -109,8 +122,12 @@ bcw_install() {
 bcw_prepare() {
     command -v jq >/dev/null || die 'Нужен небольшой пакет jq для строгой проверки JSON. Установите его через opkg/apk; тяжёлые зависимости не требуются.'
     [ "$BASE" = /opt/zapret2 ] || die 'Текущий BlockcheckW поддерживает только /opt/zapret2. Путь zapret2 не изменялся.'
-    available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
-    bcw_resources "$available_kb" || die 'Для безопасного параллельного подбора нужно 64 МБ MemAvailable. Освободите RAM; другие службы не останавливаются.'
+    available_kb=$(bcw_memory_available)
+    bcw_resources "$available_kb" || die "Для облегчённого поиска нужно минимум 48 МБ MemAvailable; сейчас ${available_kb:-неизвестно} КБ. Другие службы не останавливаются."
+    printf '\033[1;96mMemAvailable: %s КБ | Минимум перед пробой: %s КБ | Резерв при работе: %s КБ\033[0m\n' "$available_kb" "$BCW_START_KB" "$BCW_RESERVE_KB"
+    if [ "$BCW_START_KB" = 49152 ]; then
+        printf '\033[1;93mОблегчённый режим: 2 воркера, 4 профиля; контроль RAM каждую секунду. Расход памяти на этой модели ещё не измерен.\033[0m\n'
+    fi
     cpu_count=$(awk '/^processor[[:space:]]*:/ {n++} END {print n+0}' /proc/cpuinfo)
     if [ "$cpu_count" -lt 2 ]; then cpu_cap=8; elif [ "$cpu_count" -lt 4 ]; then cpu_cap=16; else cpu_cap=32; fi
     if awk -v cores="${cpu_count:-1}" '{exit !($1>2*(cores>0?cores:1))}' /proc/loadavg; then cpu_cap=4; fi
@@ -147,6 +164,8 @@ bcw_run() {
     job_label=$1; job_kind=$2; job_input=$3; job_domain=$4; job_path=$5; job_take=$6
     job_left=$(bcw_remaining)
     [ "$job_left" -ge 5 ] || return 1
+    # Recheck after download/extraction and before every new scanner process.
+    bcw_memory_at_least "$BCW_START_KB" || die "Подбор не запущен: MemAvailable ${current_kb:-неизвестно} КБ, нужно $BCW_START_KB КБ."
     job_seconds=$job_left
     if [ "$job_kind" = scan ]; then [ "$job_seconds" -le "$FAST_SECONDS" ] || job_seconds=$FAST_SECONDS
     else [ "$job_seconds" -le 60 ] || job_seconds=60; fi
@@ -178,11 +197,12 @@ bcw_run() {
     job_polls=0
     while kill -0 "$SCAN_PID" 2>/dev/null; do
         if [ "$(date +%s)" -ge "$job_end" ]; then stop_scan; return 1; fi
-        free_now=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
-        if [ "${free_now:-0}" -lt 24576 ]; then stop_scan; die 'Подбор остановлен: запас RAM меньше 24 МБ. Другие службы не тронуты.'; fi
-        sleep 2
+        if ! bcw_memory_at_least "$BCW_RESERVE_KB"; then
+            stop_scan; die "Подбор остановлен: MemAvailable ${current_kb:-неизвестно} КБ ниже резерва $BCW_RESERVE_KB КБ. Другие службы не тронуты."
+        fi
+        sleep "$BCW_POLL_SECONDS"
         job_polls=$((job_polls+1))
-        if [ "$((job_polls % 5))" = 0 ]; then say "$job_label: работа продолжается, общий остаток $(bcw_remaining) с"; fi
+        if [ "$((job_polls*BCW_POLL_SECONDS % 10))" = 0 ]; then say "$job_label: работа продолжается, общий остаток $(bcw_remaining) с"; fi
     done
     job_rc=0; wait "$SCAN_PID" || job_rc=$?
     stop_scan

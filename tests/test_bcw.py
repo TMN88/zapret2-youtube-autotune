@@ -104,11 +104,43 @@ class AdapterTests(unittest.TestCase):
         self.assertNotEqual(r.returncode,0)
 
     def test_adaptive_workers_and_memory_floor(self):
-        for ram,workers,profiles in [(65536,8,16),(100000,16,64),(200000,32,128)]:
+        for ram,workers,profiles in [(49152,2,4),(52540,2,4),(65535,2,4),
+                                    (65536,8,16),(100000,16,64),(200000,32,128)]:
             r=self.shell(f'bcw_resources {ram}; echo "$BCW_WORKERS $BCW_PROFILES"')
             self.assertEqual(r.stdout.strip(),f'{workers} {profiles}')
         self.assertNotEqual(self.shell('bcw_resources 32000').returncode,0)
         self.assertEqual(self.shell('WORKERS_LIMIT=4; bcw_resources 200000; echo "$BCW_WORKERS"').stdout.strip(),'4')
+
+    def test_low_memory_reserve_and_fail_closed_readings(self):
+        r=self.shell('bcw_resources 52540; echo "$BCW_START_KB $BCW_RESERVE_KB $BCW_POLL_SECONDS"; '
+                     'bcw_resources 100000; echo "$BCW_START_KB $BCW_RESERVE_KB $BCW_POLL_SECONDS"')
+        self.assertEqual(r.stdout.splitlines(),['49152 32768 1','65536 24576 2'])
+        for value in ['49151','0','bad','']:
+            self.assertNotEqual(self.shell(f"bcw_resources '{value}'").returncode,0)
+        for value,expected in [('32768',0),('32767',1),('',1),('bad',1)]:
+            r=self.shell(f"bcw_memory_available() {{ printf '%s' '{value}'; }}; bcw_memory_at_least 32768")
+            self.assertEqual(r.returncode,expected)
+        r=self.shell('WORKERS_LIMIT=1; bcw_resources 52540; echo "$BCW_WORKERS $BCW_PROFILES"')
+        self.assertEqual(r.stdout.strip(),'1 4')
+
+    def test_low_memory_stops_before_launch_and_cleans_running_job(self):
+        r=self.shell('bcw_resources 52540; bcw_remaining() { echo 60; }; '
+            'bcw_memory_available() { echo 48000; }; mkdir() { echo forbidden; exit 97; }; '
+            'bcw_run scan scan unused www.youtube.com / 0')
+        self.assertNotEqual(r.returncode,0)
+        self.assertNotIn('forbidden',r.stdout)
+        self.assertIn('48000',r.stderr)
+        # Exercise the actual polling loop with an inert, fake running child.
+        with tempfile.TemporaryDirectory() as d:
+            r=self.shell(f'BACKUP="{Path(d).as_posix()}"; RUN="$BACKUP"; BCW_BIN=/bin/false; '
+                'bcw_resources 52540; bcw_remaining() { echo 60; }; '
+                'bcw_memory_available() { if [ -n "$SCAN_PID" ]; then echo 32000; else echo 52540; fi; }; '
+                'kill() { return 0; }; stop_scan() { echo own-job-cleaned; }; '
+                'SCAN_DEADLINE=$(($(date +%s)+60)); BCW_QNUM=52000; '
+                'bcw_run scan scan unused www.youtube.com / 0')
+            self.assertNotEqual(r.returncode,0)
+            self.assertIn('own-job-cleaned',r.stdout)
+            self.assertIn('32768',r.stderr)
 
     def test_exact_filter_mark_capability_and_real_dry_run(self):
         for help_text,expected in [('--filter-mark=<mark>',0),('--filter-mark-neg=<mark>',1),('--filter-l7=tls',1)]:
