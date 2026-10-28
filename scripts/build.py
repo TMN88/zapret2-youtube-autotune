@@ -3,8 +3,9 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 parts = [root.joinpath('src/core.sh').read_text(encoding='utf-8'), '\n',
-         root.joinpath('src/runtime.sh').read_text(encoding='utf-8'), '\nwrite_assets() {\n']
-for source, target in [('src/select.awk', 'select.awk')]:
+         root.joinpath('src/runtime.sh').read_text(encoding='utf-8'), '\n',
+         root.joinpath('src/bcw.sh').read_text(encoding='utf-8'), '\nwrite_assets() {\n']
+for source, target in [('src/safe.awk', 'safe.awk'), ('src/bcw-report.jq', 'bcw-report.jq')]:
     marker = 'YTA_' + target.upper().replace('.', '_').replace('-', '_')
     parts += [f'    cat > "$RUN/{target}" <<\'{marker}\'\n',
               root.joinpath(source).read_text(encoding='utf-8').rstrip() + '\n', marker + '\n']

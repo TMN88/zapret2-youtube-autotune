@@ -1,7 +1,8 @@
 # Family-aware result cache and local OpenWrt procd failover. No external scheduler.
 print_results() {
     result_count=$1
-    printf '\n\033[1;97;42m РЕЗУЛЬТАТ YOUTUBE AUTOTUNE \033[0m\n'
+    printf '\n\033[1;97;42m РЕЗУЛЬТАТ YOUTUBE AUTOTUNE 4 \033[0m\n'
+    printf '\033[1;96mДвижок: %s | Время: %s с | Кандидатов: %s | Backup: %s\033[0m\n' "$ENGINE" "$(($(date +%s)-STARTED))" "$CANDIDATES" "$BACKUP"
     printf '\033[1;92mПодтверждено TCP/TLS: %s из 3 семейств\033[0m\n' "$result_count"
     printf '\033[1;96mПрименено TCP/TLS: 1 | Резервных: %s\033[0m\n' "$((result_count-1))"
     for result_n in 1 2 3; do
@@ -11,7 +12,7 @@ print_results() {
         if [ "$result_n" = 1 ]; then printf '\033[1;92m  %s. %s — АКТИВНА\033[0m\n' "$result_n" "$result_label";
         else printf '\033[1;96m  %s. %s — РЕЗЕРВ\033[0m\n' "$result_n" "$result_label"; fi
     done
-    if [ "$QUIC_STATUS" = verified ]; then printf '\033[1;92mQUIC: отдельно проверена и применена 1 UDP-стратегия\033[0m\n';
+    if [ "$QUIC_STATUS" = verified ] || [ "$QUIC_STATUS" = verified_existing ]; then printf '\033[1;92mQUIC: отдельно проверена и применена 1 UDP-стратегия\033[0m\n';
     else printf '\033[1;93mQUIC: не применена (%s)\033[0m\n' "$QUIC_STATUS"; fi
     if [ "$MONITOR" = 1 ]; then printf '\033[1;92mFailover: включён (3 сбоя → проверка резерва → переключение)\033[0m\n';
     else printf '\033[1;93mFailover: выключен\033[0m\n'; fi
@@ -31,14 +32,16 @@ family_count() {
 }
 cache_context() {
     {
-        printf '%s\n' 'youtube-families-tls12-tls13-v3' "$BASE" "$LAYOUT" "$WAN_NETWORK" "$WAN_DEV"
+        printf '%s\n' 'youtube-bcw-full-body-v4' "$BASE" "$LAYOUT" "$WAN_NETWORK" "$WAN_DEV"
         cat /etc/openwrt_release
-        sha256sum "$BASE/blockcheck2.sh" "$BASE/nfq2/nfqws2" "$BASE/blockcheck2.d/standard/"*.sh "$BASE/blockcheck2.d/standard/def.inc"
+        sha256sum "$BASE/nfq2/nfqws2" "$BASE/lua/zapret-lib.lua" "$BASE/lua/zapret-antidpi.lua"
+        if [ -f "$OWN/engine-path" ]; then engine_file=$(cat "$OWN/engine-path"); [ ! -f "$engine_file" ] || sha256sum "$engine_file"; fi
         curl --version
         ubus call "network.interface.$WAN_NETWORK" status | jsonfilter -e '@["ipv4-address"][0].address' -e '@.route[*].nexthop'
     } | sha256sum | awk '{print $1}'
 }
 cache_load() {
+    [ -f "$OWN/active.sha256" ] && sha256sum -c "$OWN/active.sha256" >/dev/null 2>&1 || return 1
     [ -f "$OWN/cache-time" ] && [ -f "$OWN/cache.sha256" ] && [ -f "$OWN/cache-context" ] || return 1
     cached_time=$(cat "$OWN/cache-time"); now=$(date +%s)
     case "$cached_time" in ''|*[!0-9]*) return 1;; esac
@@ -75,46 +78,42 @@ configure_quic() {
     QUIC_STATUS=not_needed
     if [ "$QUIC_MODE" = off ]; then QUIC_STATUS=disabled; return; fi
     if ! curl --version | grep -q ' HTTP3'; then QUIC_STATUS=unsupported_curl; return; fi
-    # Need means: healthy TCP, HTTP3 available, two direct QUIC failures.
     if quic_probe; then QUIC_STATUS=direct_ok; return; fi
     sleep 3
     if quic_probe; then QUIC_STATUS=direct_ok; return; fi
-    verify_installed || die 'TCP перестал работать перед QUIC; откат.'
+    # BlockcheckW 0.12.1 has no QUIC. Revalidate a saved profile, never launch a legacy scanner.
+    QUIC_STATUS=unsupported_by_scanner
+    [ -s "$BACKUP/cached-quic.txt" ] || return 0
+    old_quic=$(cat "$BACKUP/cached-quic.txt")
+    printf '%s\n' "$old_quic" | awk -f "$RUN/safe.awk" | grep -Fxq -- "$old_quic" || return 0
+    "$BASE/nfq2/nfqws2" --dry-run --qnum=300 "--lua-init=@$BASE/lua/zapret-lib.lua" \
+      "--lua-init=@$BASE/lua/zapret-antidpi.lua" --filter-udp=443 --filter-l7=quic $old_quic > "$BACKUP/quic-dry-run.log" 2>&1 || return 0
     assert_unchanged
     /etc/init.d/zapret2 stop
-    printf '%s\n' www.youtube.com > "$RUN/quic-discovery-target"
-    printf '%s\n' www.youtube.com i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg > "$RUN/quic-targets"
-    : > "$RUN/quic-selected"
-    if [ "$CACHED" = 1 ] && [ -s "$BACKUP/cached-quic.txt" ]; then
-        cp "$BACKUP/cached-quic.txt" "$RUN/quic-selected"
-    else
-      : > "$RUN/candidates"
-      scan discover-quic discover quic "$RUN/quic-discovery-target"
-      select_log "$BACKUP/discover-quic.log" "$RUN/quic-discovery-target" curl_test_http3 1 > "$RUN/quic-pool" || true
-      cp "$RUN/quic-pool" "$RUN/candidates"
-      if [ -s "$RUN/candidates" ]; then
-        scan verify-quic verify quic "$RUN/quic-targets"
-        select_log "$BACKUP/verify-quic.log" "$RUN/quic-targets" curl_test_http3 0 > "$RUN/quic-selected" || true
-      fi
-    fi
-    if [ -s "$RUN/quic-selected" ]; then
-        QUIC_ARGS=$(sed -n '1p' "$RUN/quic-selected")
-        if [ "$LAYOUT" = uci ]; then stage_quic; else stage_profile 1 "$(cat "$BACKUP/strategy-1.txt")"; fi
-        /etc/init.d/zapret2 start
+    QUIC_ARGS=$old_quic
+    if [ "$LAYOUT" = uci ]; then stage_quic; uci changes zapret2 > "$BACKUP/quic.changes";
+    else stage_profile 1 "$(cat "$BACKUP/strategy-1.txt")"; fi
+    quic_ok=0
+    if /etc/init.d/zapret2 start > "$BACKUP/quic-start.log" 2>&1; then
         sleep 2
-        if quic_probe && quic_probe && verify_installed; then
-            if [ "$LAYOUT" = uci ]; then uci commit zapret2; fi
-            printf '%s\n' "$QUIC_ARGS" > "$OWN/quic.txt"
-            sha256sum "$CONFIG" > "$BACKUP/config.sha256"
-            QUIC_STATUS=verified
-            return
-        fi
-        /etc/init.d/zapret2 stop
+        if quic_probe && quic_probe && verify_installed; then quic_ok=1; fi
     fi
+    sha256sum -c "$BACKUP/config.sha256" >/dev/null || { : > "$BACKUP/conflict"; die 'Параллельная запись во время проверки QUIC.'; }
+    if [ "$LAYOUT" = uci ]; then
+        uci changes zapret2 > "$RUN/current.changes"
+        cmp -s "$RUN/current.changes" "$BACKUP/quic.changes" || { : > "$BACKUP/conflict"; die 'Параллельные UCI-изменения во время QUIC.'; }
+    fi
+    if [ "$quic_ok" = 1 ]; then
+        [ "$LAYOUT" != uci ] || uci commit zapret2
+        printf '%s\n' "$QUIC_ARGS" > "$OWN/quic.txt"
+        sha256sum "$CONFIG" > "$BACKUP/config.sha256"
+        QUIC_STATUS=verified_existing
+        return
+    fi
+    /etc/init.d/zapret2 stop || true
     QUIC_ARGS=
     if [ "$LAYOUT" = uci ]; then uci revert zapret2; else stage_profile 1 "$(cat "$BACKUP/strategy-1.txt")"; fi
-    rm -f "$OWN/quic.txt"
-    /etc/init.d/zapret2 start
+    /etc/init.d/zapret2 start || die 'Не удалось вернуть рабочий TCP после проверки QUIC.'
     QUIC_STATUS=not_found
 }
 
@@ -130,6 +129,7 @@ WAN_DEV='$WAN_DEV'
 EOF
     printf '1\n' > "$OWN/active"
     sha256sum "$CONFIG" > "$OWN/active.sha256"
+    [ -z "$BCW_BIN" ] || printf '%s\n' "$BCW_BIN" > "$OWN/engine-path"
     cache_context > "$OWN/cache-context"
     if [ "$CACHED" = 0 ]; then date +%s > "$OWN/cache-time"; fi
     sha256sum "$OWN"/strategy-*.txt > "$OWN/cache.sha256"

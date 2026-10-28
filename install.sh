@@ -1,14 +1,14 @@
 #!/bin/sh
-# MIT. Uses the installed Blockcheck2; does not install/replace zapret2.
+# MIT. BlockcheckW-only search; does not replace the installed zapret2.
 set -eu
-VERSION=3.0.0
+VERSION=4.0.0
 BASE=/opt/zapret2
 OWN=/etc/zapret2-youtube-autotune
 LOCK=/var/lock/zapret2-youtube-autotune.lock
 WAN_NETWORK=wan
 REPEATS=3
 WANT=3
-TIME_LIMIT=1800
+TIME_LIMIT=600
 MODE=autotune
 BACKUP=
 RUN=
@@ -40,19 +40,20 @@ banner() {
 }
 help() {
     cat <<'HELP'
-YouTube Autotune 3: OpenWrt 24.10/25.12, installed native Blockcheck2.
+YouTube Autotune 4 — Fast Strategy Scanner (BlockcheckW only).
 sh install.sh [--want 2|3] [--base /opt/zapret2] [--wan-network wan]
-  --scan-seconds N        Discovery time limit per pass (default 1800).
+  --scan-seconds N        Total search/check budget in seconds (default 600).
+  --workers N            Cap adaptive workers at 1–32.
   --media-url-file FILE   Optional fresh HTTPS googlevideo media URL from this WAN.
   --check                Read-only prerequisites, no network tests.
   --refresh              Ignore the 24-hour WAN/engine-scoped result cache.
-  --no-quic              Skip optional QUIC discovery (default: auto if HTTP3 exists).
+  --no-quic              Skip direct QUIC and revalidation of an existing QUIC profile.
   --no-failover          Do not enable the local failover service.
   --status               Show the installed monitor status and active TCP strategy.
   --rollback BACKUP      Restore the original stopped service and configuration.
   --help | --version
 Default: one verified alternative per TCP Segmentation / Multi / Fake-Seqovl family.
-One active, up to two reserves; local procd failover. Optional verified QUIC only if needed.
+One active, up to two reserves; local procd failover. Existing QUIC may be revalidated; this scanner has no QUIC search.
 TLS 1.2 + 1.3; no HTTP3 downloads, Podkop changes or package installation.
 Supports Routerich/Manager UCI and official shell configuration; unknown layouts fail closed.
 HELP
@@ -64,15 +65,14 @@ preflight() {
     . /etc/openwrt_release
     case "$DISTRIB_RELEASE" in 24.10*|25.12*) ;; *) die 'Поддерживаются OpenWrt 24.10/25.12.';; esac
     available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
-    [ "${available_kb:-0}" -ge 32000 ] || die 'Для подбора недостаточно RAM (нужно 32 МБ MemAvailable).'
-    for cmd in uci curl awk sed sort cmp sha256sum setsid nft ubus jsonfilter tar; do
+    [ "${available_kb:-0}" -ge 24576 ] || die 'Для подбора недостаточно RAM (нужно 24 МБ MemAvailable для применения кэша; 64 МБ для поиска).'
+    for cmd in uci curl awk sed sort cmp sha256sum setsid nft ubus jsonfilter tar ip od cut head; do
         command -v "$cmd" >/dev/null || die "Нет $cmd. Установите недостающую зависимость вручную (opkg на 24 / apk на 25)."
     done
     case "$BASE" in /*) ;; *) die 'Нужен абсолютный --base.';; esac
     case "$BASE" in *[!A-Za-z0-9_./-]*) die 'Недопустимый --base.';; esac
     BASE=$(readlink -f "$BASE")
-    [ -x "$BASE/blockcheck2.sh" ] && [ -x "$BASE/nfq2/nfqws2" ] || die 'Установите zapret2 и Blockcheck2 вручную.'
-    [ -d "$BASE/blockcheck2.d/standard" ] && [ -f "$BASE/blockcheck2.d/custom/10-list.sh" ] || die 'Нет native standard/custom тестов Blockcheck2.'
+    [ -x "$BASE/nfq2/nfqws2" ] || die 'Установите zapret2 вручную.'
     [ -x /etc/init.d/zapret2 ] || die 'Нет службы /etc/init.d/zapret2.'
     # procd status alone is insufficient on some packages.
     if /etc/init.d/zapret2 running >/dev/null 2>&1 || pidof nfqws2 >/dev/null 2>&1; then
@@ -94,7 +94,7 @@ preflight() {
         [ -f "$OWN/owner" ] && [ "$(cat "$OWN/owner")" = zapret2-youtube-autotune ] || die "Папка $OWN принадлежит другой программе."
     fi
     if [ "$LAYOUT" = uci ]; then guard_reserved_sections; fi
-    say "YouTube Autotune $VERSION: OpenWrt $DISTRIB_RELEASE, $LAYOUT, WAN $WAN_DEV."
+    say "YouTube Autotune 4 — Fast Strategy Scanner $VERSION: OpenWrt $DISTRIB_RELEASE, $DISTRIB_ARCH, $LAYOUT, WAN $WAN_DEV."
 }
 
 guard_reserved_sections() {
@@ -149,7 +149,7 @@ if [ "$(cat "$b/layout")" = uci ]; then uci -q revert zapret2 || true; fi
 cp -p "$b/original-config" "$c"
 if [ -f "$b/base-config" ]; then cp -p "$b/base-config" "$base/config"; fi
 rm -f /etc/zapret2-youtube-autotune/youtube.txt /etc/zapret2-youtube-autotune/owner
-for f in control.sh runtime.conf active active.sha256 cache-context cache-time cache.sha256 quic.txt; do
+for f in control.sh runtime.conf active active.sha256 cache-context cache-time cache.sha256 quic.txt engine-path; do
     rm -f "/etc/zapret2-youtube-autotune/$f"
 done
 for n in 1 2 3; do rm -f "/etc/zapret2-youtube-autotune/strategy-$n.txt"; done
@@ -162,7 +162,7 @@ else
     rmdir /etc/zapret2-youtube-autotune 2>/dev/null || true
 fi
 if [ ! -f "$b/owned.tar.gz" ]; then
-    for f in control.sh runtime.conf active active.sha256 cache-context cache-time cache.sha256 quic.txt; do
+    for f in control.sh runtime.conf active active.sha256 cache-context cache-time cache.sha256 quic.txt engine-path; do
         rm -f "/etc/zapret2-youtube-autotune/$f"
     done
     rmdir /etc/zapret2-youtube-autotune 2>/dev/null || true
@@ -193,7 +193,8 @@ if [ -f "$b/scan-pid" ]; then
     kill -s TERM -- "-$p" 2>/dev/null || true
     sleep 2
     kill -s KILL -- "-$p" 2>/dev/null || true
-    nft delete table inet "blockcheck2-$p" 2>/dev/null || true
+    t=$(cat "$b/scan-table" 2>/dev/null || true)
+    case "$t" in "yta_bcw_${parent}_"*) nft delete table inet "$t" 2>/dev/null || true;; esac
 fi
 if [ -f "$b/changed" ] && [ ! -f "$b/conflict" ] && [ ! -f "$b/finished" ]; then
     sh "$b/rollback.sh" > "$b/watchdog.log" 2>&1 || exit 1
@@ -220,9 +221,12 @@ stop_scan() {
     kill -s KILL -- "-$SCAN_PID" 2>/dev/null || true
     wait "$SCAN_PID" 2>/dev/null || true
     # Only this invocation's table; no global blockcheck/nfqws sweep.
-    nft delete table inet "blockcheck2-$SCAN_PID" 2>/dev/null || true
+    if [ -n "${SCAN_TABLE:-}" ]; then
+        case "$SCAN_TABLE" in "yta_bcw_$$_"*) nft delete table inet "$SCAN_TABLE" 2>/dev/null || true;; esac
+    fi
+    SCAN_TABLE=
     SCAN_PID=
-    rm -f "$BACKUP/scan-pid"
+    rm -f "$BACKUP/scan-pid" "$BACKUP/scan-table"
 }
 cleanup() {
     rc=$?
@@ -243,6 +247,10 @@ cleanup() {
         if [ "$SUCCESS" != 1 ] && [ "$CHANGED" = 0 ] && [ -f "$BACKUP/monitor-service" ] && [ "$(cat "$BACKUP/monitor-running")" = 1 ]; then /etc/init.d/youtube-failover start; fi
         : > "$BACKUP/finished"
     fi
+    if [ "$MODE" = autotune ] && [ "$rc" != 0 ]; then
+        printf '\033[1;91mКандидатов: %s | Успешное применение этого запуска: 0\033[0m\n' "$CANDIDATES" >&2
+        [ ! -f "$BACKUP/rollback.sh" ] || say "Восстановление: sh $BACKUP/rollback.sh" >&2
+    fi
     [ -z "$WATCH_PID" ] || kill "$WATCH_PID" 2>/dev/null || true
     if [ "$LOCK_HELD" = 1 ]; then rm -f "$LOCK/pid" "$LOCK/backup"; rmdir "$LOCK" 2>/dev/null || true; fi
     exit "$rc"
@@ -253,120 +261,6 @@ assert_unchanged() {
         : > "$BACKUP/conflict"
         die 'Конфигурация изменена другим процессом; остановка без её перезаписи.'
     fi
-}
-
-prepare_blockcheck() {
-    # Private test tree; upstream code and binary versions remain matched.
-    mkdir -p "$RUN/bc/blockcheck2.d/discover" "$RUN/bc/blockcheck2.d/verify"
-    for d in common lua nfq2 mdig binaries; do
-        [ ! -d "$BASE/$d" ] || ln -s "$BASE/$d" "$RUN/bc/$d"
-    done
-    cp "$BASE/blockcheck2.sh" "$RUN/bc/blockcheck2.sh"
-    cp "$BASE/blockcheck2.d/standard/"* "$RUN/bc/blockcheck2.d/discover/"
-    cp "$BASE/blockcheck2.d/custom/10-list.sh" "$RUN/bc/blockcheck2.d/verify/"
-    : > "$RUN/bc/config"
-    # Hook uses public pktws test API rather than rewriting the installed engine.
-    # Name sorts before native scripts, so it is sourced before any trials.
-    cat > "$RUN/bc/blockcheck2.d/discover/00-yta.sh" <<'HOOK'
-pktws_curl_test_update()
-{
-    local yta_code family count
-    case " $* " in
-        *--payload=quic_initial*) family=quic; count=${YTA_QUIC:-0};;
-        *seqovl=*|*--lua-desync=fake:*) family=fake; count=${YTA_FAKE:-0};;
-        *--lua-desync=tcpseg:*) family=tcpseg; count=${YTA_TCPSEG:-0};;
-        *--lua-desync=multisplit:*|*--lua-desync=multidisorder:*) family=multi; count=${YTA_MULTI:-0};;
-        *) return 1;;
-    esac
-    [ "$count" -lt 3 ] || return 0
-    pktws_curl_test "$@"; yta_code=$?
-    if [ "$yta_code" = 0 ]; then
-        shift; shift
-        strategy="${strategy:-$*}"
-        # Only successes are counted; the outer parser also checks all attempts.
-        case "$family" in tcpseg) YTA_TCPSEG=$((count+1));; multi) YTA_MULTI=$((count+1));; fake) YTA_FAKE=$((count+1));; quic) YTA_QUIC=$((count+1));; esac
-        if [ "${YTA_QUIC:-0}" -ge 3 ] || { [ "${YTA_TCPSEG:-0}" -ge 3 ] && [ "${YTA_MULTI:-0}" -ge 3 ] && [ "${YTA_FAKE:-0}" -ge 3 ]; }; then unprepare_all; exit 0; fi
-    fi
-    return "$yta_code"
-}
-HOOK
-    export YTA_CURL="$(command -v curl)" YTA_WAN="$WAN_DEV"
-    cat > "$RUN/curl-wrapper" <<'WRAPPER'
-#!/bin/sh
-exec "$YTA_CURL" --interface "$YTA_WAN" --noproxy '*' "$@"
-WRAPPER
-    chmod 700 "$RUN/curl-wrapper"
-    printf '%s\n' www.youtube.com i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg youtubei.googleapis.com redirector.googlevideo.com > "$RUN/targets"
-}
-
-scan() {
-    label=$1; test=$2; proto=$3; targets=$4
-    log="$BACKUP/$label.log"
-    say "Blockcheck2: $label (только YouTube, $REPEATS последовательных попытки)."
-    # Start directly via setsid: recorded PID equals the engine's process group/table ID.
-    env ZAPRET_BASE="$RUN/bc" ZAPRET_RW="$RUN/bc" ZAPRET_CONFIG="$RUN/bc/config" \
-      NFQWS2="$BASE/nfq2/nfqws2" MDIG="$BASE/mdig/mdig" SIMULATE=0 SKIP_PKTWS=0 \
-      CURL="$RUN/curl-wrapper" TEST="$test" DOMAINS="$(cat "$targets")" BATCH=1 IPVS=4 \
-      SCANLEVEL=force PARALLEL=0 REPEATS="$REPEATS" FWTYPE=nftables \
-      LIST_HTTPS_TLS13="$RUN/candidates" LIST_HTTPS_TLS12="$RUN/candidates" LIST_QUIC="$RUN/candidates" \
-      ENABLE_HTTP=0 ENABLE_HTTPS_TLS12="$([ "$proto" = tls12 ] && echo 1 || echo 0)" \
-      ENABLE_HTTPS_TLS13="$([ "$proto" = tls13 ] && echo 1 || echo 0)" ENABLE_HTTP3="$([ "$proto" = quic ] && echo 1 || echo 0)" \
-      SECURE_DNS=1 SKIP_DNSCHECK=1 SKIP_IPBLOCK=1 DOH_SERVER=https://dns.google/dns-query \
-      CURL_MAX_TIME=8 CURL_MAX_TIME_DOH=8 CURL_HTTPS_GET=1 PACE=300 \
-      setsid sh "$RUN/bc/blockcheck2.sh" > "$log" 2>&1 &
-    SCAN_PID=$!
-    printf '%s\n' "$SCAN_PID" > "$BACKUP/scan-pid"
-    seconds=0
-    while kill -0 "$SCAN_PID" 2>/dev/null; do
-        if [ "$seconds" -ge "$TIME_LIMIT" ]; then
-            say "Лимит времени $label; используем только завершённые успешные тесты."
-            stop_scan
-            return 0
-        fi
-        sleep 2; seconds=$((seconds+2))
-    done
-    scan_rc=0; wait "$SCAN_PID" || scan_rc=$?
-    stop_scan
-    [ "$scan_rc" = 0 ] || die "Blockcheck2: код $scan_rc, см. $log"
-}
-
-select_log() {
-    # One parser for discovered and allowlisted validation candidates.
-    awk -v targets="$2" -v repeats="$REPEATS" -v protocol="$3" -v discover="$4" \
-      -f "$RUN/select.awk" "$RUN/candidates" "$1"
-}
-
-choose() {
-    if [ "$REFRESH" = 0 ] && cache_load; then CACHED=1; say 'Используются сохранённые результаты (тот же WAN/движок, не старше 24 часов).'; return; fi
-    printf '%s\n' www.youtube.com > "$RUN/discovery-target"
-    : > "$RUN/candidates"
-    scan discover-tls13 discover tls13 "$RUN/discovery-target"
-    select_log "$BACKUP/discover-tls13.log" "$RUN/discovery-target" curl_test_https_tls13 1 > "$RUN/pool" || true
-    awk '!seen[$0]++' "$RUN/pool" > "$RUN/candidates"
-    : > "$RUN/selected"
-    if [ -s "$RUN/candidates" ]; then verify_candidates primary; fi
-    # Fallback only when the verified pool is short; never re-test old candidates.
-    if [ "$(family_count "$RUN/selected")" -lt "$WANT" ]; then
-        cp "$RUN/candidates" "$RUN/tried"
-        scan discover-tls12 discover tls12 "$RUN/discovery-target"
-        select_log "$BACKUP/discover-tls12.log" "$RUN/discovery-target" curl_test_https_tls12 1 > "$RUN/extra" || true
-        awk 'FILENAME==ARGV[1] {seen[$0]=1; next} !seen[$0]++' "$RUN/tried" "$RUN/extra" > "$RUN/candidates"
-        if [ -s "$RUN/candidates" ]; then verify_candidates fallback; fi
-    fi
-    validated_count=$(family_count "$RUN/selected")
-    if [ "$validated_count" -lt 2 ]; then
-        printf '\033[1;91mПодтверждено TCP/TLS: %s из 3 | Применено: 0\033[0m\n' "$validated_count"
-        die 'Меньше двух разных семейств прошли все цели и оба TLS. Конфигурация не менялась.'
-    fi
-}
-
-verify_candidates() {
-    batch=$1
-    scan "verify-$batch-tls13" verify tls13 "$RUN/targets"
-    select_log "$BACKUP/verify-$batch-tls13.log" "$RUN/targets" curl_test_https_tls13 0 > "$RUN/ok13" || true
-    scan "verify-$batch-tls12" verify tls12 "$RUN/targets"
-    select_log "$BACKUP/verify-$batch-tls12.log" "$RUN/targets" curl_test_https_tls12 0 > "$RUN/ok12" || true
-    awk 'FILENAME==ARGV[1] {ok[$0]=1; next} $0 in ok' "$RUN/ok13" "$RUN/ok12" >> "$RUN/selected"
 }
 
 disable_strategies() {
@@ -435,7 +329,7 @@ probe() {
 }
 
 verify_installed() {
-    for attempt in 1 2 3; do
+    for attempt in 1; do
         probe www.youtube.com/ 200 10000 || return 1
         probe i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg 200 1000 || return 1
         probe youtubei.googleapis.com/ endpoint 0 || return 1
@@ -466,7 +360,7 @@ prepare_media() {
 apply_profiles() {
     assert_unchanged
     CHANGED=1; : > "$BACKUP/changed"
-    if [ "$CACHED" = 1 ] && [ -s "$OWN/quic.txt" ]; then cp "$OWN/quic.txt" "$BACKUP/cached-quic.txt"; fi
+    if [ -s "$OWN/quic.txt" ] && [ -f "$OWN/cache.sha256" ] && sha256sum -c "$OWN/cache.sha256" >/dev/null 2>&1; then cp "$OWN/quic.txt" "$BACKUP/cached-quic.txt"; fi
     mkdir -p "$OWN"
     rm -f "$OWN/quic.txt"
     printf 'zapret2-youtube-autotune\n' > "$OWN/owner"
@@ -531,6 +425,7 @@ apply_profiles() {
     sha256sum "$CONFIG" > "$BACKUP/config.sha256"
     configure_quic
     install_runtime
+    phase_end
     SUCCESS=1
     : > "$BACKUP/finished"
     print_results "$accepted"
@@ -545,10 +440,10 @@ main() {
             --help|-h) help; return;; --version) say "$VERSION"; return;; --check) MODE=check;;
             --no-quic) QUIC_MODE=off;; --refresh) REFRESH=1;; --no-failover) MONITOR=0;;
             --monitor-loop|--failover-once|--status) runtime_main "$1"; return;;
-            --base|--wan-network|--want|--scan-seconds|--media-url-file)
+            --base|--wan-network|--want|--scan-seconds|--media-url-file|--workers)
                 [ "$#" -ge 2 ] || die "Нет значения $1"
                 opt=$1; shift
-                case "$opt" in --base) BASE=$1;; --wan-network) WAN_NETWORK=$1;; --want) WANT=$1;; --scan-seconds) TIME_LIMIT=$1;; --media-url-file) MEDIA_FILE=$1;; esac;;
+                case "$opt" in --base) BASE=$1;; --wan-network) WAN_NETWORK=$1;; --want) WANT=$1;; --scan-seconds) TIME_LIMIT=$1;; --media-url-file) MEDIA_FILE=$1;; --workers) WORKERS_LIMIT=$1;; esac;;
             --rollback)
                 [ "$#" = 2 ] || die 'Нужны только --rollback и backup.'
                 resolved=$(readlink -f "$2")
@@ -558,7 +453,11 @@ main() {
         esac
         shift
     done
+    STARTED=$(date +%s)
+    printf '\033[1;96mYouTube Autotune 4 — Fast Strategy Scanner\033[0m\n'
     banner
+    case "$WORKERS_LIMIT" in ''|*[!0-9]*) die 'Некорректный --workers.';; esac
+    [ "$WORKERS_LIMIT" -ge 1 ] && [ "$WORKERS_LIMIT" -le 32 ] || die '--workers: 1–32.'
     valid_name "$WAN_NETWORK" || die 'Недопустимое имя WAN.'
     case "$WANT" in 2|3) ;; *) die '--want: только 2 или 3.';; esac
     case "$TIME_LIMIT" in ''|*[!0-9]*) die 'Некорректный --scan-seconds.';; esac
@@ -567,18 +466,21 @@ main() {
     [ "$MODE" != check ] || return 0
     trap cleanup EXIT
     trap 'exit 130' HUP INT TERM
+    phase_start 'Подготовка и резервная копия'
     backup
     write_assets
     prepare_media
-    prepare_blockcheck
+    phase_end
     choose
+    phase_start 'Применение и проверка через службу zapret2'
     apply_profiles
 }
 
 # Family-aware result cache and local OpenWrt procd failover. No external scheduler.
 print_results() {
     result_count=$1
-    printf '\n\033[1;97;42m РЕЗУЛЬТАТ YOUTUBE AUTOTUNE \033[0m\n'
+    printf '\n\033[1;97;42m РЕЗУЛЬТАТ YOUTUBE AUTOTUNE 4 \033[0m\n'
+    printf '\033[1;96mДвижок: %s | Время: %s с | Кандидатов: %s | Backup: %s\033[0m\n' "$ENGINE" "$(($(date +%s)-STARTED))" "$CANDIDATES" "$BACKUP"
     printf '\033[1;92mПодтверждено TCP/TLS: %s из 3 семейств\033[0m\n' "$result_count"
     printf '\033[1;96mПрименено TCP/TLS: 1 | Резервных: %s\033[0m\n' "$((result_count-1))"
     for result_n in 1 2 3; do
@@ -588,7 +490,7 @@ print_results() {
         if [ "$result_n" = 1 ]; then printf '\033[1;92m  %s. %s — АКТИВНА\033[0m\n' "$result_n" "$result_label";
         else printf '\033[1;96m  %s. %s — РЕЗЕРВ\033[0m\n' "$result_n" "$result_label"; fi
     done
-    if [ "$QUIC_STATUS" = verified ]; then printf '\033[1;92mQUIC: отдельно проверена и применена 1 UDP-стратегия\033[0m\n';
+    if [ "$QUIC_STATUS" = verified ] || [ "$QUIC_STATUS" = verified_existing ]; then printf '\033[1;92mQUIC: отдельно проверена и применена 1 UDP-стратегия\033[0m\n';
     else printf '\033[1;93mQUIC: не применена (%s)\033[0m\n' "$QUIC_STATUS"; fi
     if [ "$MONITOR" = 1 ]; then printf '\033[1;92mFailover: включён (3 сбоя → проверка резерва → переключение)\033[0m\n';
     else printf '\033[1;93mFailover: выключен\033[0m\n'; fi
@@ -608,14 +510,16 @@ family_count() {
 }
 cache_context() {
     {
-        printf '%s\n' 'youtube-families-tls12-tls13-v3' "$BASE" "$LAYOUT" "$WAN_NETWORK" "$WAN_DEV"
+        printf '%s\n' 'youtube-bcw-full-body-v4' "$BASE" "$LAYOUT" "$WAN_NETWORK" "$WAN_DEV"
         cat /etc/openwrt_release
-        sha256sum "$BASE/blockcheck2.sh" "$BASE/nfq2/nfqws2" "$BASE/blockcheck2.d/standard/"*.sh "$BASE/blockcheck2.d/standard/def.inc"
+        sha256sum "$BASE/nfq2/nfqws2" "$BASE/lua/zapret-lib.lua" "$BASE/lua/zapret-antidpi.lua"
+        if [ -f "$OWN/engine-path" ]; then engine_file=$(cat "$OWN/engine-path"); [ ! -f "$engine_file" ] || sha256sum "$engine_file"; fi
         curl --version
         ubus call "network.interface.$WAN_NETWORK" status | jsonfilter -e '@["ipv4-address"][0].address' -e '@.route[*].nexthop'
     } | sha256sum | awk '{print $1}'
 }
 cache_load() {
+    [ -f "$OWN/active.sha256" ] && sha256sum -c "$OWN/active.sha256" >/dev/null 2>&1 || return 1
     [ -f "$OWN/cache-time" ] && [ -f "$OWN/cache.sha256" ] && [ -f "$OWN/cache-context" ] || return 1
     cached_time=$(cat "$OWN/cache-time"); now=$(date +%s)
     case "$cached_time" in ''|*[!0-9]*) return 1;; esac
@@ -652,46 +556,42 @@ configure_quic() {
     QUIC_STATUS=not_needed
     if [ "$QUIC_MODE" = off ]; then QUIC_STATUS=disabled; return; fi
     if ! curl --version | grep -q ' HTTP3'; then QUIC_STATUS=unsupported_curl; return; fi
-    # Need means: healthy TCP, HTTP3 available, two direct QUIC failures.
     if quic_probe; then QUIC_STATUS=direct_ok; return; fi
     sleep 3
     if quic_probe; then QUIC_STATUS=direct_ok; return; fi
-    verify_installed || die 'TCP перестал работать перед QUIC; откат.'
+    # BlockcheckW 0.12.1 has no QUIC. Revalidate a saved profile, never launch a legacy scanner.
+    QUIC_STATUS=unsupported_by_scanner
+    [ -s "$BACKUP/cached-quic.txt" ] || return 0
+    old_quic=$(cat "$BACKUP/cached-quic.txt")
+    printf '%s\n' "$old_quic" | awk -f "$RUN/safe.awk" | grep -Fxq -- "$old_quic" || return 0
+    "$BASE/nfq2/nfqws2" --dry-run --qnum=300 "--lua-init=@$BASE/lua/zapret-lib.lua" \
+      "--lua-init=@$BASE/lua/zapret-antidpi.lua" --filter-udp=443 --filter-l7=quic $old_quic > "$BACKUP/quic-dry-run.log" 2>&1 || return 0
     assert_unchanged
     /etc/init.d/zapret2 stop
-    printf '%s\n' www.youtube.com > "$RUN/quic-discovery-target"
-    printf '%s\n' www.youtube.com i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg > "$RUN/quic-targets"
-    : > "$RUN/quic-selected"
-    if [ "$CACHED" = 1 ] && [ -s "$BACKUP/cached-quic.txt" ]; then
-        cp "$BACKUP/cached-quic.txt" "$RUN/quic-selected"
-    else
-      : > "$RUN/candidates"
-      scan discover-quic discover quic "$RUN/quic-discovery-target"
-      select_log "$BACKUP/discover-quic.log" "$RUN/quic-discovery-target" curl_test_http3 1 > "$RUN/quic-pool" || true
-      cp "$RUN/quic-pool" "$RUN/candidates"
-      if [ -s "$RUN/candidates" ]; then
-        scan verify-quic verify quic "$RUN/quic-targets"
-        select_log "$BACKUP/verify-quic.log" "$RUN/quic-targets" curl_test_http3 0 > "$RUN/quic-selected" || true
-      fi
-    fi
-    if [ -s "$RUN/quic-selected" ]; then
-        QUIC_ARGS=$(sed -n '1p' "$RUN/quic-selected")
-        if [ "$LAYOUT" = uci ]; then stage_quic; else stage_profile 1 "$(cat "$BACKUP/strategy-1.txt")"; fi
-        /etc/init.d/zapret2 start
+    QUIC_ARGS=$old_quic
+    if [ "$LAYOUT" = uci ]; then stage_quic; uci changes zapret2 > "$BACKUP/quic.changes";
+    else stage_profile 1 "$(cat "$BACKUP/strategy-1.txt")"; fi
+    quic_ok=0
+    if /etc/init.d/zapret2 start > "$BACKUP/quic-start.log" 2>&1; then
         sleep 2
-        if quic_probe && quic_probe && verify_installed; then
-            if [ "$LAYOUT" = uci ]; then uci commit zapret2; fi
-            printf '%s\n' "$QUIC_ARGS" > "$OWN/quic.txt"
-            sha256sum "$CONFIG" > "$BACKUP/config.sha256"
-            QUIC_STATUS=verified
-            return
-        fi
-        /etc/init.d/zapret2 stop
+        if quic_probe && quic_probe && verify_installed; then quic_ok=1; fi
     fi
+    sha256sum -c "$BACKUP/config.sha256" >/dev/null || { : > "$BACKUP/conflict"; die 'Параллельная запись во время проверки QUIC.'; }
+    if [ "$LAYOUT" = uci ]; then
+        uci changes zapret2 > "$RUN/current.changes"
+        cmp -s "$RUN/current.changes" "$BACKUP/quic.changes" || { : > "$BACKUP/conflict"; die 'Параллельные UCI-изменения во время QUIC.'; }
+    fi
+    if [ "$quic_ok" = 1 ]; then
+        [ "$LAYOUT" != uci ] || uci commit zapret2
+        printf '%s\n' "$QUIC_ARGS" > "$OWN/quic.txt"
+        sha256sum "$CONFIG" > "$BACKUP/config.sha256"
+        QUIC_STATUS=verified_existing
+        return
+    fi
+    /etc/init.d/zapret2 stop || true
     QUIC_ARGS=
     if [ "$LAYOUT" = uci ]; then uci revert zapret2; else stage_profile 1 "$(cat "$BACKUP/strategy-1.txt")"; fi
-    rm -f "$OWN/quic.txt"
-    /etc/init.d/zapret2 start
+    /etc/init.d/zapret2 start || die 'Не удалось вернуть рабочий TCP после проверки QUIC.'
     QUIC_STATUS=not_found
 }
 
@@ -707,6 +607,7 @@ WAN_DEV='$WAN_DEV'
 EOF
     printf '1\n' > "$OWN/active"
     sha256sum "$CONFIG" > "$OWN/active.sha256"
+    [ -z "$BCW_BIN" ] || printf '%s\n' "$BCW_BIN" > "$OWN/engine-path"
     cache_context > "$OWN/cache-context"
     if [ "$CACHED" = 0 ]; then date +%s > "$OWN/cache-time"; fi
     sha256sum "$OWN"/strategy-*.txt > "$OWN/cache.sha256"
@@ -842,62 +743,311 @@ runtime_main() {
     esac
 }
 
+# BlockcheckW-only adapter. Pinned official musl release; no Rust on the router.
+BCW_VERSION=v0.12.1
+BCW_BIN=
+BCW_TOOLS=/usr/libexec/youtube-autotune
+BCW_WORKERS=0
+BCW_PROFILES=0
+BCW_TABLE=
+BCW_QNUM=
+SCAN_TABLE=
+CANDIDATES=0
+ENGINE=BlockcheckW
+STARTED=0
+SCAN_DEADLINE=0
+FAST_SECONDS=90
+WORKERS_LIMIT=32
+
+phase_start() { PHASE=$1; PHASE_AT=$(date +%s); printf '\033[1;96m%s\033[0m\n' "$PHASE"; }
+phase_end() { printf '\033[1;96m%s: %s с\033[0m\n' "$PHASE" "$(($(date +%s)-PHASE_AT))"; }
+bcw_arch() {
+    case "$1" in
+        aarch64*|arm64*) echo arm64;; arm*) echo arm;; x86_64*) echo x86_64;; i?86*|x86) echo x86;;
+        mipsel*|mipsle*) echo mipsel;; mips64el*) return 1;; mips64*) echo mips64;; mips*)
+            case "$2" in 1) echo mipsel;; 2) echo mips;; *) return 1;; esac;;
+        riscv64*) echo riscv64;; ppc*|powerpc*) echo ppc;; *) return 1;;
+    esac
+}
+bcw_sha() {
+    case "$1" in
+        arm) echo ad61c9efe034c02a6d5956379cf3ae093aec9c6093f087f8f75f81c3aa56b96c;;
+        arm64) echo 689c37a7a47514dd04033e487599989dab9ad7699a9ca02136b059b9359ebc31;;
+        mips) echo b61c9a43a4901ebad00687e4a029fe69d599d75a2bedca1fbc69e77f2f831532;;
+        mipsel) echo cb67663bcd52557e106f07d798feced1bf62a0e348b15db6a9a0f2f2eb4e8694;;
+        mips64) echo f971449f97843eca790bc56c44377f4b80036d63b0b9792340ddfd4d135ce18f;;
+        x86_64) echo db4e959f8675c62fcbfb63e1ba68c63fc0903d2258aaa9090d00bd5610978da9;;
+        x86) echo c53adb01c3d8acba3928481f23c26a27cb1e32c5202c851adea8cef6cbae6dc1;;
+        ppc) echo c0a24cac011ff42ded388d7af1bc1d0b31bc42a0da35e30808d1805d94a13367;;
+        riscv64) echo 7c5b1ae4ae36a048987bd25b49a54ac3e2b09134d302bff239832c0cb1bd9b34;;
+        *) return 1;;
+    esac
+}
+bcw_resources() {
+    case "$1" in ''|*[!0-9]*) return 1;; esac
+    if [ "$1" -lt 65536 ]; then return 1
+    elif [ "$1" -lt 98304 ]; then BCW_WORKERS=8; BCW_PROFILES=16
+    elif [ "$1" -lt 163840 ]; then BCW_WORKERS=16; BCW_PROFILES=64
+    else BCW_WORKERS=32; BCW_PROFILES=128; fi
+    [ "$BCW_WORKERS" -le "$WORKERS_LIMIT" ] || BCW_WORKERS=$WORKERS_LIMIT
+}
+bcw_capability() {
+    "$BASE/nfq2/nfqws2" --help > "$RUN/nfq-help" 2>&1 || true
+    grep -Eq -- '--filter-mark([^A-Za-z0-9_-]|$)' "$RUN/nfq-help" || return 1
+    "$BASE/nfq2/nfqws2" --dry-run --qnum=300 --filter-mark=1/0xFFFF \
+      "--lua-init=@$BASE/lua/zapret-lib.lua" "--lua-init=@$BASE/lua/zapret-antidpi.lua" \
+      --payload=tls_client_hello --lua-desync=multisplit:pos=1 > "$RUN/mark-dry-run" 2>&1
+}
+bcw_binary_ok() {
+    [ -x "$1" ] || return 1
+    "$1" --help > "$RUN/bcw-help" 2>&1 || return 1
+    for flag in embedded profiles-per-instance qnum nft-table mark-base desync-mark smoke-qnum-base progress; do
+        grep -q -- "--$flag" "$RUN/bcw-help" || return 1
+    done
+}
+bcw_install() {
+    BCW_ARCH=$(bcw_arch "${DISTRIB_ARCH:-$(uname -m)}" "$(od -An -tu1 -j5 -N1 /bin/busybox 2>/dev/null | tr -d ' ')" ) || die 'Нет совместимой архитектуры BlockcheckW. Медленный резервный движок отключён.'
+    candidate=$(command -v blockcheckw 2>/dev/null || true)
+    if [ -n "$candidate" ] && bcw_binary_ok "$candidate"; then BCW_BIN=$candidate; return; fi
+    if [ -e "$BCW_TOOLS" ]; then
+        [ -f "$BCW_TOOLS/owner" ] && [ "$(cat "$BCW_TOOLS/owner")" = zapret2-youtube-autotune ] || die 'Каталог бинарников занят другой программой.'
+    fi
+    candidate="$BCW_TOOLS/blockcheckw-$BCW_VERSION-$BCW_ARCH"
+    if [ -f "$candidate.sha256" ] && sha256sum -c "$candidate.sha256" >/dev/null 2>&1 && bcw_binary_ok "$candidate"; then BCW_BIN=$candidate; return; fi
+    tarball="blockcheckw-linux-$BCW_ARCH.tar.gz"
+    expected=$(bcw_sha "$BCW_ARCH") || die 'Нет доверенной SHA256 для архитектуры.'
+    curl --interface "$WAN_DEV" --noproxy '*' -fSL --connect-timeout 10 --max-time 90 \
+      "https://github.com/rcd27/blockcheckw/releases/download/$BCW_VERSION/$tarball" -o "$RUN/bcw.tar.gz" || die 'Не удалось скачать официальный BlockcheckW. Резервного движка нет.'
+    printf '%s  %s\n' "$expected" "$RUN/bcw.tar.gz" | sha256sum -c - || die 'SHA256 BlockcheckW не совпала; файл не запускается.'
+    # Extract one known regular member into our private file; never unpack paths from the archive.
+    tar -xOzf "$RUN/bcw.tar.gz" blockcheckw > "$RUN/blockcheckw" || die 'Не удалось извлечь бинарник.'
+    rm -f "$RUN/bcw.tar.gz"
+    chmod 700 "$RUN/blockcheckw"
+    bcw_binary_ok "$RUN/blockcheckw" || die 'Бинарник BlockcheckW не запускается или не поддерживает безопасный embedded-режим.'
+    bytes=$(wc -c < "$RUN/blockcheckw")
+    flash_kb=$(df -k /usr | awk 'END {print $4}')
+    case "$flash_kb" in ''|*[!0-9]*) die 'Не удалось проверить свободное место для бинарника.';; esac
+    [ "$flash_kb" -ge "$((bytes/1024+2048))" ] || die 'Недостаточно flash: нужен размер бинарника и ещё 2 МБ для журналов/восстановления.'
+    # Binary cache is separate from configuration backups: do not write megabytes
+    # of identical binaries to flash on every failover transaction.
+    mkdir -p "$BCW_TOOLS"
+    chmod 700 "$BCW_TOOLS"
+    printf 'zapret2-youtube-autotune\n' > "$BCW_TOOLS/owner"
+    if ! cp "$RUN/blockcheckw" "$candidate.part"; then rm -f "$candidate.part"; die 'Не удалось сохранить бинарник; временный файл удалён.'; fi
+    mv "$candidate.part" "$candidate"
+    chmod 700 "$candidate"
+    sha256sum "$candidate" > "$candidate.sha256"
+    rm -f "$RUN/blockcheckw"
+    BCW_BIN=$candidate
+}
+bcw_prepare() {
+    command -v jq >/dev/null || die 'Нужен небольшой пакет jq для строгой проверки JSON. Установите его через opkg/apk; тяжёлые зависимости не требуются.'
+    [ "$BASE" = /opt/zapret2 ] || die 'Текущий BlockcheckW поддерживает только /opt/zapret2. Путь zapret2 не изменялся.'
+    available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    bcw_resources "$available_kb" || die 'Для безопасного параллельного подбора нужно 64 МБ MemAvailable. Освободите RAM; другие службы не останавливаются.'
+    cpu_count=$(awk '/^processor[[:space:]]*:/ {n++} END {print n+0}' /proc/cpuinfo)
+    if [ "$cpu_count" -lt 2 ]; then cpu_cap=8; elif [ "$cpu_count" -lt 4 ]; then cpu_cap=16; else cpu_cap=32; fi
+    if awk -v cores="${cpu_count:-1}" '{exit !($1>2*(cores>0?cores:1))}' /proc/loadavg; then cpu_cap=4; fi
+    [ "$BCW_WORKERS" -le "$cpu_cap" ] || BCW_WORKERS=$cpu_cap
+    [ "$BCW_PROFILES" -le "$((BCW_WORKERS*4))" ] || BCW_PROFILES=$((BCW_WORKERS*4))
+    bcw_capability || die 'Установленный nfqws2 не поддерживает --filter-mark (нужен zapret2 >= 1.0.5). Движок не заменялся.'
+    bcw_install
+    BCW_QNUM=$((52000+($$ % 1000)*10))
+    # One data queue plus a disjoint ten-queue smoke-test range, all within u16.
+    if [ -r /proc/net/netfilter/nfnetlink_queue ]; then
+        awk -v first="$BCW_QNUM" '$1>=first && $1<=first+11 {busy=1} END {exit busy}' /proc/net/netfilter/nfnetlink_queue || die 'Выбранный диапазон NFQUEUE занят; повторите запуск.'
+    fi
+    # This is a local route lookup, not an Internet probe. Never change policy routing.
+    for mark in 0x20000001 0x2000ffff; do
+        route=$(ip -4 route get 8.8.8.8 mark "$mark") || die 'Не удалось проверить маршрут помеченных проб.'
+        case " $route " in *" dev $WAN_DEV "*) ;; *) die 'Помеченные пробы BlockcheckW уйдут не через выбранный WAN. Маршруты не менялись.';; esac
+    done
+    mkdir -p "$RUN/bcw-tools"
+    export YTA_CURL="$(command -v curl)" YTA_WAN="$WAN_DEV"
+    # Upstream invokes curl for optional ISP information. Suppress that unrelated request.
+    cat > "$RUN/bcw-tools/curl" <<'CURL'
+#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in *ipinfo.io*|*api.github.com*) exit 1;; esac
+done
+exec "$YTA_CURL" --interface "$YTA_WAN" --noproxy '*' "$@"
+CURL
+    chmod 700 "$RUN/bcw-tools/curl"
+    printf '\033[1;96mДвижок: BlockcheckW %s | Архитектура: %s | Воркеров: %s | Профилей: %s | Лимит: %s с\033[0m\n' "$BCW_VERSION" "$BCW_ARCH" "$BCW_WORKERS" "$BCW_PROFILES" "$TIME_LIMIT"
+}
+bcw_remaining() { left=$((SCAN_DEADLINE-$(date +%s))); [ "$left" -gt 0 ] || left=0; echo "$left"; }
+bcw_run() {
+    # $1 label, $2 scan|check, $3 input for check, $4 domain, $5 path, $6 take.
+    job_label=$1; job_kind=$2; job_input=$3; job_domain=$4; job_path=$5; job_take=$6
+    job_left=$(bcw_remaining)
+    [ "$job_left" -ge 5 ] || return 1
+    job_seconds=$job_left
+    if [ "$job_kind" = scan ]; then [ "$job_seconds" -le "$FAST_SECONDS" ] || job_seconds=$FAST_SECONDS
+    else [ "$job_seconds" -le 60 ] || job_seconds=60; fi
+    job_dir="$BACKUP/$job_label"
+    mkdir "$job_dir" || return 1
+    SCAN_TABLE="yta_bcw_$$_$job_label"
+    printf '%s\n' "$SCAN_TABLE" > "$BACKUP/scan-table"
+    say "BlockcheckW: $job_label, лимит $job_seconds с"
+    (
+        cd "$job_dir" || exit 1
+        set -- "$BCW_BIN" --embedded --no-conflict-cleanup --auto --progress \
+          -w "$BCW_WORKERS" --profiles-per-instance "$BCW_PROFILES" --qnum "$BCW_QNUM" \
+          --smoke-qnum-base "$((BCW_QNUM+2))" --nft-table "$SCAN_TABLE" --mark-base 0x20000000 --desync-mark 0x10000000
+        if [ "$job_kind" = scan ]; then
+            set -- "$@" scan -d www.youtube.com -p tls13,tls12 --dns doh --timeout "$job_seconds" --top 0
+        else
+            set -- "$@" check --from-file "$job_input" -d "$job_domain" --dns doh --passes 3 \
+              --take "$job_take" --timeout 8 --idle-ms 1500 --deadline "$job_seconds" --probe-path "$job_path" --identity-path /robots.txt --output "$job_dir/report.json"
+        fi
+        exec env PATH="$RUN/bcw-tools:$PATH" HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= http_proxy= https_proxy= all_proxy= \
+          setsid "$@"
+    ) > "$job_dir/stdout.json" 2> "$job_dir/progress.log" &
+    SCAN_PID=$!
+    JOB_PID=$SCAN_PID
+    JOB_TABLE=$SCAN_TABLE
+    printf '%s\n' "$SCAN_PID" > "$BACKUP/scan-pid"
+    job_end=$(($(date +%s)+job_seconds+10))
+    [ "$job_end" -le "$SCAN_DEADLINE" ] || job_end=$SCAN_DEADLINE
+    job_polls=0
+    while kill -0 "$SCAN_PID" 2>/dev/null; do
+        if [ "$(date +%s)" -ge "$job_end" ]; then stop_scan; return 1; fi
+        free_now=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+        if [ "${free_now:-0}" -lt 24576 ]; then stop_scan; die 'Подбор остановлен: запас RAM меньше 24 МБ. Другие службы не тронуты.'; fi
+        sleep 2
+        job_polls=$((job_polls+1))
+        if [ "$((job_polls % 5))" = 0 ]; then say "$job_label: работа продолжается, общий остаток $(bcw_remaining) с"; fi
+    done
+    job_rc=0; wait "$SCAN_PID" || job_rc=$?
+    stop_scan
+    [ "$job_rc" = 0 ] || return 1
+    if [ "$job_kind" = scan ]; then
+        JOB_REPORT=
+        for f in "$job_dir/"*_scan.json; do [ ! -f "$f" ] || JOB_REPORT=$f; done
+        [ -n "$JOB_REPORT" ] || return 1
+    else JOB_REPORT="$job_dir/report.json"; fi
+    [ -s "$JOB_REPORT" ]
+}
+bcw_read() {
+    # Validate report provenance before reading any candidate args.
+    jq -er --arg mode "$1" --arg domain "$2" --arg table "$JOB_TABLE" --argjson pid "$JOB_PID" \
+      --argjson qnum "$BCW_QNUM" --argjson workers "$BCW_WORKERS" --argjson profiles "$BCW_PROFILES" \
+      -f "$RUN/bcw-report.jq" "$JOB_REPORT" 2>> "$BACKUP/json-errors.log"
+}
+bcw_input() {
+    # $1 lines of safe args, $2 protocol, $3 destination. Use JSON, never eval.
+    jq -Rn --arg protocol "$2" '[inputs | select(length>0) | {protocol:$protocol,args:.,coverage:1}] | {strategies:.}' < "$1" > "$3"
+}
+bcw_validate() {
+    candidate_args=$1; family=$2; serial=$3
+    printf '%s\n' "$candidate_args" > "$RUN/one-args"
+    # TLS1.3 on www was just checked: do not repeat it.
+    for target_id in main preview api cdn; do
+        case "$target_id" in
+            main) target_host=www.youtube.com; target_path=/; protocols='HTTPS/TLS1.2';;
+            preview) target_host=i.ytimg.com; target_path=/vi/jNQXAC9IVRw/hqdefault.jpg; protocols='HTTPS/TLS1.2 HTTPS/TLS1.3';;
+            api) target_host=youtubei.googleapis.com; target_path=/; protocols='HTTPS/TLS1.2 HTTPS/TLS1.3';;
+            cdn) target_host=redirector.googlevideo.com; target_path=/; protocols='HTTPS/TLS1.2 HTTPS/TLS1.3';;
+        esac
+        jq -n --arg args "$candidate_args" --arg protocols "$protocols" \
+          '{strategies:($protocols|split(" ")|map({protocol:.,args:$args,coverage:1}))}' > "$RUN/check-input.json"
+        bcw_run "verify_${family}_${serial}_$target_id" check "$RUN/check-input.json" "$target_host" "$target_path" 1 || return 1
+        bcw_read auxiliary "$target_host" > "$RUN/verified.tsv" || return 1
+        for proto in $protocols; do
+            awk -F '\t' -v proto="$proto" -v args="$candidate_args" '$1==proto && $2==args {ok=1} END {exit !ok}' "$RUN/verified.tsv" || return 1
+        done
+    done
+}
+choose() {
+    phase_start 'Быстрое сканирование и проверка кэша'
+    if [ "$REFRESH" = 0 ] && cache_load; then
+        CACHED=1; CANDIDATES=$(wc -l < "$RUN/selected"); ENGINE='BlockcheckW (кэш)'; phase_end; return
+    fi
+    bcw_prepare
+    SCAN_DEADLINE=$(($(date +%s)+TIME_LIMIT))
+    bcw_run scan scan '' www.youtube.com / 0 || die 'BlockcheckW не завершил быстрый поиск. См. backup; медленного резервного пути нет.'
+    bcw_read scan www.youtube.com > "$RUN/discovered.tsv" || die 'BlockcheckW: нет доказанного поиска (доступно напрямую, ошибка или недопустимый JSON).'
+    cut -f2 "$RUN/discovered.tsv" | awk '!seen[$0]++' | awk -f "$RUN/safe.awk" > "$RUN/pool"
+    CANDIDATES=$(wc -l < "$RUN/pool")
+    say "Найдено безопасных разных кандидатов: $CANDIDATES"
+    phase_end
+    phase_start 'Контрольные тесты: 3 полные загрузки, TLS 1.3 / TLS 1.2'
+    : > "$RUN/selected"
+    for family in tcpseg multi fake; do
+        : > "$RUN/family-args"
+        while IFS= read -r args; do
+            [ "$(strategy_family "$args")" != "$family" ] || printf '%s\n' "$args" >> "$RUN/family-args"
+        done < "$RUN/pool"
+        # A bounded family pool avoids spending the entire budget on small variations.
+        head -n 4 "$RUN/family-args" > "$RUN/todo"
+        serial=0
+        while [ -s "$RUN/todo" ]; do
+            serial=$((serial+1))
+            bcw_input "$RUN/todo" HTTPS/TLS1.3 "$RUN/check-input.json"
+            bcw_run "check_${family}_$serial" check "$RUN/check-input.json" www.youtube.com / 1 || break
+            bcw_read causal www.youtube.com > "$RUN/checked.tsv" || break
+            selected=$(awk -F '\t' '$1=="HTTPS/TLS1.3" {print $2;exit}' "$RUN/checked.tsv")
+            [ -n "$selected" ] || break
+            # Input membership plus token validation; never trust newly invented report args.
+            grep -Fxq -- "$selected" "$RUN/todo" || die 'JSON вернул неизвестную стратегию.'
+            printf '%s\n' "$selected" | awk -f "$RUN/safe.awk" | grep -Fxq -- "$selected" || die 'Недопустимые параметры в JSON.'
+            if bcw_validate "$selected" "$family" "$serial"; then
+                printf '%s\n' "$selected" >> "$RUN/selected"
+                printf '\033[1;92mПодтверждено семейство: %s\033[0m\n' "$family"
+                break
+            fi
+            awk -v selected="$selected" '$0!=selected' "$RUN/todo" > "$RUN/next"; mv "$RUN/next" "$RUN/todo"
+        done
+        [ "$(family_count "$RUN/selected")" -lt "$WANT" ] || break
+    done
+    phase_end
+    confirmed=$(family_count "$RUN/selected")
+    if [ "$confirmed" -lt 2 ]; then
+        printf '\033[1;91mПодтверждено: %s | Применено: 0\033[0m\n' "$confirmed"
+        die 'Недостаточно подтверждённых семейств для Failover. Повторный медленный поиск не запускается.'
+    fi
+}
+
 write_assets() {
-    cat > "$RUN/select.awk" <<'YTA_SELECT_AWK'
-# Strict native Blockcheck2 parser. SUMMARY and baseline are never trials.
-function safe(s,    n,a,i) {
-    # Custom Blockcheck2 uses eval internally: admit only inert argv tokens.
-    if (s == "" || s ~ /[^A-Za-z0-9_.,:+=\/@ -]/) return 0
-    n=split(s,a,/ +/)
+    cat > "$RUN/safe.awk" <<'YTA_SAFE_AWK'
+# Admit inert nfqws2 argv only. Never eval output from any scanner.
+{
+    if ($0=="" || $0 ~ /[^A-Za-z0-9_.,:+=\/@ -]/) next
+    n=split($0,a,/ +/); ok=1; desync=0
     for(i=1;i<=n;i++) {
-        if(a[i] ~ /^--payload=(tls_client_hello|quic_initial)$/) continue
-        if(a[i] ~ /^--lua-desync=[A-Za-z0-9_.,:+=\/@-]+$/) continue
+        if(a[i]=="--payload=tls_client_hello" || a[i]=="--payload=quic_initial") continue
+        if(a[i] ~ /^--lua-desync=luaexec:/) {ok=0;continue}
+        if(a[i] ~ /^--lua-desync=[A-Za-z0-9_.,:+=\/@-]+$/) {desync=1;continue}
         if(a[i] ~ /^--(out-range|in-range|out-seq|in-seq)=[A-Za-z0-9_.,:+=-]+$/) continue
-        return 0
+        ok=0
     }
-    return index(s,"--lua-desync=") > 0
+    if(ok && desync) print
 }
-BEGIN {
-    while ((getline t < targets) > 0) if (t != "" && !(t in wanted)) { wanted[t]=1; nt++ }
-    close(targets)
-}
-FILENAME==ARGV[1] { if($0!="" && $0!~/^#/) allowed[$0]=1; next }
-/^- / || /^\* / || /^curl_test_/ {
-    current=""; count=0; failed=0
-    for(i in seen) delete seen[i]
-    prefix="- " protocol " ipv4 "
-    if(index($0,prefix)!=1) next
-    n=split($0,parts,/ : nfqws2 /)
-    if(n!=2 || !safe(parts[2]) || (!discover && !(parts[2] in allowed))) next
-    domain=substr(parts[1],length(prefix)+1)
-    if(!(domain in wanted)) next
-    current=parts[2]
-    if(!(current in order)) {order[current]=++ns; ordered[ns]=current}
-    blocks[current SUBSEP domain]++
-    next
-}
-current!="" {
-    if(index($0,"UNAVAILABLE") || index($0,"curl: (")) failed=1
-    if($0~/\[attempt [0-9]+\] AVAILABLE/) {
-        k=$0; sub(/.*\[attempt /,"",k); sub(/\].*/,"",k)
-        if(k>=1 && k<=repeats && !(k in seen)) {seen[k]=1;count++}
-    }
-    if($0=="!!!!! AVAILABLE !!!!!") {
-        if(!failed && count==repeats) passed[current SUBSEP domain]=1
-        current=""
-    }
-}
-END {
-    if(nt==0 || repeats<2) exit 3
-    found=0
-    for(j=1;j<=ns;j++) {
-        s=ordered[j];ok=1
-        for(t in wanted) if(!passed[s SUBSEP t] || blocks[s SUBSEP t]!=1) ok=0
-        if(ok) {print s;found++}
-    }
-    if(!found) exit 2
-}
-YTA_SELECT_AWK
+YTA_SAFE_AWK
+    cat > "$RUN/bcw-report.jq" <<'YTA_BCW_REPORT_JQ'
+# JSON contract of BlockcheckW 0.12.1 (schema 1), not its human-readable output.
+def fail($s): error($s);
+if .schema != 1 or .domain != $domain then fail("schema/domain mismatch") else . end |
+if (.run.embedded != true or .run.dns != "doh" or .run.qnum != $qnum or
+    .run.nft_table != $table or .run.process_group != $pid or
+    .run.mark_base != "0x20000000" or .run.desync_mark != "0x10000000" or
+    (.run.bcw_version|type) != "string" or (.run.bcw_version|length)==0) then fail("untrusted run provenance") else . end |
+if ($mode=="scan" and (.run.workers != $workers or .run.profiles_per_instance != $profiles)) or
+   ($mode!="scan" and (.run.workers != 1 or .run.profiles_per_instance != 1))
+then fail("resource profile mismatch") else . end |
+if .outcome=="broken" or .outcome=="censored" or .outcome=="nothing_works" then fail("no completed evidence") else . end |
+if $mode!="scan" and ((.control|type)!="object" or (.inconclusive|type)!="boolean") then fail("missing control evidence") else . end |
+if $mode!="auxiliary" and (.outcome!="found" or .inconclusive==true) then fail("control passed or no evidence") else . end |
+if $mode=="auxiliary" and (.outcome!="found" and .outcome!="not_blocked") then fail("invalid outcome") else . end |
+if (.strategies|type)!="array" then fail("missing strategies") else . end |
+.strategies[] |
+select(.protocol=="HTTPS/TLS1.2" or .protocol=="HTTPS/TLS1.3") |
+select((.args|type)=="string" and (.args|test("^[A-Za-z0-9_.,:+=/@ -]+$"))) |
+select($mode=="scan" or
+       (.working==true and .passes_ok==3 and .passes_total==3 and .observed=="Bytes" and
+        (.admits|type)=="array" and (.admits|length)>0 and .admits!=["Mirage"])) |
+[.protocol,.args] | @tsv
+YTA_BCW_REPORT_JQ
 }
 
 if [ "${YTA_LIBRARY_ONLY:-0}" != 1 ]; then main "$@"; fi

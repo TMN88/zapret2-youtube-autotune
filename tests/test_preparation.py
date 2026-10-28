@@ -37,23 +37,6 @@ class TransactionTests(unittest.TestCase):
         self.assertNotIn('apk add',core)
         self.assertNotIn('killall',core)
 
-    def test_native_hook_calls_real_engine_then_cleans_before_early_exit(self):
-        with tempfile.TemporaryDirectory() as d:
-            p=Path(d)
-            for sub in ['base/blockcheck2.d/standard','base/blockcheck2.d/custom','run']:
-                (p/sub).mkdir(parents=True)
-            (p/'base/blockcheck2.sh').write_text('#!/bin/sh\n')
-            (p/'base/blockcheck2.d/standard/def.inc').write_text('# fixture\n')
-            (p/'base/blockcheck2.d/custom/10-list.sh').write_text('# fixture\n')
-            r=self.shell(f'BASE="{p.as_posix()}/base"; RUN="{p.as_posix()}/run"; WAN_DEV=wan; '
-                'prepare_blockcheck; . "$RUN/bc/blockcheck2.d/discover/00-yta.sh"; '
-                'pktws_curl_test() { echo real-trial; return 0; }; '
-                'unprepare_all() { echo cleaned; }; '
-                'YTA_TCPSEG=3; YTA_MULTI=2; YTA_FAKE=3; '
-                'pktws_curl_test_update tls youtube --lua-desync=multisplit:pos=1; echo unreachable')
-            self.assertEqual(r.returncode,0,r.stderr)
-            self.assertEqual(r.stdout.splitlines(),['real-trial','cleaned'])
-
     def test_shell_profile_is_standalone_and_original_is_preserved(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)

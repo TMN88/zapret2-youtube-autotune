@@ -31,7 +31,8 @@ class RuntimeTests(unittest.TestCase):
                 (p/'cache-context').write_text('other' if variant=='wan' else 'context')
                 command=(f'OWN="{p.as_posix()}"; RUN="$OWN"; date() {{ echo 200000; }}; '
                     'cache_context() { echo context; }; '
-                    'sha256sum "$OWN/strategy-1.txt" "$OWN/strategy-2.txt" > "$OWN/cache.sha256"; ')
+                    'sha256sum "$OWN/strategy-1.txt" "$OWN/strategy-2.txt" > "$OWN/cache.sha256"; '
+                    'sha256sum "$OWN/strategy-1.txt" > "$OWN/active.sha256"; ')
                 if variant=='tampered': command+='printf evil >> "$OWN/strategy-1.txt"; '
                 r=self.shell(command+'cache_load')
                 self.assertEqual(r.returncode,expected,r.stderr)
